@@ -1,13 +1,21 @@
-from . import core
-from . import algos
-from . import backtest
-
-from .backtest import Backtest, run
-from .core import Strategy, Algo, AlgoStack, FixedIncomeStrategy
-from .core import Security, FixedIncomeSecurity, CouponPayingSecurity
-from .core import HedgeSecurity, CouponPayingHedgeSecurity
-
 import ffn
-from ffn import utils, data, get, merge
+from ffn import data, get, merge, utils
 
-__version__ = (0, 2, 10)
+from . import algos, backtest, core
+from .backtest import Backtest, run
+from .core import (
+    Algo,
+    AlgoStack,
+    AlmgrenChrissCostModel,
+    CostModel,
+    CouponPayingHedgeSecurity,
+    CouponPayingSecurity,
+    FixedIncomeSecurity,
+    FixedIncomeStrategy,
+    HedgeSecurity,
+    Security,
+    SqrtCostModel,
+    Strategy,
+)
+
+__version__ = "1.4.1"

@@ -1,20 +1,20 @@
 from __future__ import division
-import bt
-import pandas as pd
+
 import numpy as np
-from nose.tools import assert_almost_equal as aae
+import pandas as pd
+import pytest
 import random
-import sys
-if sys.version_info < (3, 3):
-    import mock
-else:
-    from unittest import mock
+
+from unittest import mock
+
+import bt
 
 
 def test_backtest_copies_strategy():
     s = mock.MagicMock()
-    data = pd.DataFrame(index=pd.date_range('2010-01-01', periods=5),
-                        columns=['a', 'b'], data=100)
+    data = pd.DataFrame(
+        index=pd.date_range("2010-01-01", periods=5), columns=["a", "b"], data=100
+    )
 
     actual = bt.Backtest(s, data, progress_bar=False)
 
@@ -23,8 +23,9 @@ def test_backtest_copies_strategy():
 
 def test_backtest_dates_set():
     s = mock.MagicMock()
-    data = pd.DataFrame(index=pd.date_range('2010-01-01', periods=5),
-                        columns=['a', 'b'], data=100)
+    data = pd.DataFrame(
+        index=pd.date_range("2010-01-01", periods=5), columns=["a", "b"], data=100
+    )
 
     actual = bt.Backtest(s, data, progress_bar=False)
 
@@ -34,21 +35,48 @@ def test_backtest_dates_set():
     assert actual.dates[-1] == data.index[-1]
 
 
-def test_backtest_auto_name():
+def test_backtest_rejects_unsorted_dates():
     s = mock.MagicMock()
-    s.name = 's'
-    data = pd.DataFrame(index=pd.date_range('2010-01-01', periods=5),
-                        columns=['a', 'b'], data=100)
+    data = pd.DataFrame(
+        index=pd.to_datetime(["2010-01-03", "2010-01-01", "2010-01-04"]),
+        columns=["a", "b"],
+        data=100,
+    )
+
+    with pytest.raises(ValueError, match="monotonic increasing"):
+        bt.Backtest(s, data, progress_bar=False)
+
+
+def test_backtest_accepts_monotonic_duplicate_dates():
+    s = mock.MagicMock()
+    data = pd.DataFrame(
+        index=pd.to_datetime(["2010-01-01", "2010-01-01", "2010-01-02"]),
+        columns=["a", "b"],
+        data=100,
+    )
 
     actual = bt.Backtest(s, data, progress_bar=False)
 
-    assert actual.name == 's'
+    assert actual.dates[1:].equals(data.index)
+
+
+def test_backtest_auto_name():
+    s = mock.MagicMock()
+    s.name = "s"
+    data = pd.DataFrame(
+        index=pd.date_range("2010-01-01", periods=5), columns=["a", "b"], data=100
+    )
+
+    actual = bt.Backtest(s, data, progress_bar=False)
+
+    assert actual.name == "s"
 
 
 def test_initial_capital_set():
     s = mock.MagicMock()
-    data = pd.DataFrame(index=pd.date_range('2010-01-01', periods=5),
-                        columns=['a', 'b'], data=100)
+    data = pd.DataFrame(
+        index=pd.date_range("2010-01-01", periods=5), columns=["a", "b"], data=100
+    )
 
     actual = bt.Backtest(s, data, initial_capital=302, progress_bar=False)
     actual.run()
@@ -62,8 +90,9 @@ def test_run_loop():
     s = mock.MagicMock()
     # run loop checks on this
     s.bankrupt = False
-    data = pd.DataFrame(index=pd.date_range('2010-01-01', periods=5),
-                        columns=['a', 'b'], data=100)
+    data = pd.DataFrame(
+        index=pd.date_range("2010-01-01", periods=5), columns=["a", "b"], data=100
+    )
 
     actual = bt.Backtest(s, data, initial_capital=302, progress_bar=False)
     actual.run()
@@ -75,46 +104,806 @@ def test_run_loop():
     assert s.run.call_count == 5
 
 
+@pytest.mark.parametrize("depth", [1, 2])
+def test_bootstrap_preserves_child_momentum(depth):
+    dates = pd.date_range("2024-01-01", periods=5)
+    prices = pd.DataFrame({"x": [100.0, 110.0, 120.0, 130.0, 140.0], "y": 100.0}, index=dates)
+
+    def child(name, ticker):
+        result = bt.Strategy(
+            name,
+            [bt.algos.RunOnce(), bt.algos.SelectThese([ticker]), bt.algos.WeighEqually(), bt.algos.Rebalance()],
+            children=[ticker],
+        )
+        if depth == 2:
+            result = bt.Strategy(
+                name,
+                [bt.algos.RunOnce(), bt.algos.SelectAll(), bt.algos.WeighEqually(), bt.algos.Rebalance()],
+                children=[result],
+            )
+        return result
+
+    class ParentWeights(bt.Algo):
+        def __call__(self, target):
+            if target.now == dates[0]:
+                target.temp["weights"] = {"slow": 0.5, "fast": 0.5}
+            else:
+                target.temp["selected"] = ["slow", "fast"]
+                bt.algos.SelectMomentum(1, lookback=pd.DateOffset(days=2))(target)
+                bt.algos.WeighEqually()(target)
+                target.perm["momentum_selection"] = list(target.temp["selected"])
+            return True
+
+    strategy = bt.Strategy(
+        "parent",
+        [bt.algos.RunOnDate(dates[0], dates[2]), ParentWeights(), bt.algos.Rebalance()],
+        children=[child("slow", "y"), child("fast", "x")],
+    )
+    backtest = bt.Backtest(strategy, prices, initial_capital=1000, integer_positions=False, progress_bar=False)
+    backtest.run()
+    parent = backtest.strategy
+    # Child prices must inform selection; a correct real NAV alone can hide a
+    # paper RunOnce consumed before the first available market price.
+    np.testing.assert_allclose(parent["fast"].prices.loc[dates], [100, 110, 120, 130, 140])
+    np.testing.assert_allclose(parent.universe.loc[dates, "fast"], [100, 110, 120, 130, 140])
+    assert parent.perm["momentum_selection"] == ["fast"]
+    # Five shares of each cost 1000. On Jan 3 the 1100 NAV buys 1100/120 x;
+    # the following day's independent cash + quantity * price is 1191 2/3.
+    assert parent.values.loc[dates[2]] == pytest.approx(5 * 120 + 5 * 100)
+    assert parent.positions.loc[dates[3], "x"] == pytest.approx(1100 / 120)
+    assert parent.positions.loc[dates[3], "y"] == pytest.approx(0)
+    assert parent.values.loc[dates[3]] == pytest.approx(1100 * 130 / 120)
+
+
+@pytest.mark.parametrize("missing_first_price", [False, True])
+def test_paper_algos_run_on_every_real_date(missing_first_price):
+    dates = pd.date_range("2024-01-01", periods=3)
+    prices = pd.DataFrame({"x": [100.0, 110.0, 120.0]}, index=dates)
+    if missing_first_price:
+        prices.iloc[0] = np.nan
+
+    class RecordDate(bt.Algo):
+        def __call__(self, target):
+            target.perm.setdefault("dates", []).append(target.now)
+            return True
+
+    child = bt.Strategy("child", [RecordDate()])
+    backtest = bt.Backtest(bt.Strategy("parent", children=[child]), prices, progress_bar=False)
+    backtest.run()
+    # An all-missing real bar is still a trading date, unlike the added row.
+    assert backtest.strategy["child"]._paper.perm["dates"] == list(dates)
+    assert backtest.strategy["child"].perm["dates"] == list(dates)
+
+
+def test_bootstrap_marker_clears_after_update_failure():
+    dates = pd.date_range("2024-01-01", periods=2)
+    backtest = bt.Backtest(bt.Strategy("parent"), pd.DataFrame({"x": 100.0}, index=dates), progress_bar=False)
+    with (
+        mock.patch.object(backtest.strategy, "update", side_effect=ValueError("update failed")),
+        pytest.raises(ValueError, match="update failed"),
+    ):
+        backtest.run()
+    assert backtest.strategy._in_bootstrap is False
+
+
 def test_turnover():
-    dts = pd.date_range('2010-01-01', periods=5)
-    data = pd.DataFrame(index=dts, columns=['a', 'b'], data=100)
+    dts = pd.date_range("2010-01-01", periods=5)
+    data = pd.DataFrame(index=dts, columns=["a", "b"], data=100)
 
-    data['a'][dts[1]] = 105
-    data['b'][dts[1]] = 95
+    data.loc[dts[1], "a"] = 105
+    data.loc[dts[1], "b"] = 95
 
-    data['a'][dts[2]] = 110
-    data['b'][dts[2]] = 90
+    data.loc[dts[2], "a"] = 110
+    data.loc[dts[2], "b"] = 90
 
-    data['a'][dts[3]] = 115
-    data['b'][dts[3]] = 85
+    data.loc[dts[3], "a"] = 115
+    data.loc[dts[3], "b"] = 85
 
-    s = bt.Strategy('s', [bt.algos.SelectAll(),
-                          bt.algos.WeighEqually(),
-                          bt.algos.Rebalance()])
+    s = bt.Strategy(
+        "s", [bt.algos.SelectAll(), bt.algos.WeighEqually(), bt.algos.Rebalance()]
+    )
 
     t = bt.Backtest(s, data, commissions=lambda x, y: 0, progress_bar=False)
     res = bt.run(t)
 
-    t = res.backtests['s']
+    t = res.backtests["s"]
 
     # these numbers were (tediously) calculated in excel
-    assert np.allclose(t.turnover[dts[0]], 0. / 1000000)
-    assert np.allclose(t.turnover[dts[1]], 24985. / 1000000)
-    assert np.allclose(t.turnover[dts[2]], 24970. / 997490)
-    assert np.allclose(t.turnover[dts[3]], 25160. / 992455)
-    assert np.allclose(t.turnover[dts[4]], 76100. / 1015285)
+    assert np.allclose(t.turnover[dts[0]], 0.0 / 1000000)
+    assert np.allclose(t.turnover[dts[1]], 24985.0 / 1000000)
+    assert np.allclose(t.turnover[dts[2]], 24970.0 / 997490)
+    assert np.allclose(t.turnover[dts[3]], 25160.0 / 992455)
+    assert np.allclose(t.turnover[dts[4]], 76100.0 / 1015285)
+
+
+@pytest.mark.parametrize(
+    ("weights", "expected"),
+    [
+        pytest.param({"a": 0.5, "b": 0.5}, 0.5, id="fully-invested"),
+        pytest.param({"a": 0.25, "b": 0.25}, 0.5, id="cash-reserve"),
+        pytest.param({"a": 2.0, "b": -1.0}, 5.0 / 9.0, id="leveraged-long-short"),
+        pytest.param({"a": 0.2, "b": -0.1}, 5.0 / 9.0, id="scaled-long-short"),
+    ],
+)
+def test_herfindahl_index_normalizes_gross_security_exposure(weights, expected):
+    dates = pd.date_range("2024-01-01", periods=2)
+    prices = pd.DataFrame(100.0, index=dates, columns=["a", "b"])
+    strategy = bt.Strategy(
+        "ordinary",
+        [
+            bt.algos.RunOnce(),
+            bt.algos.WeighSpecified(**weights),
+            bt.algos.Rebalance(),
+        ],
+    )
+    backtest = bt.Backtest(
+        strategy,
+        prices,
+        integer_positions=False,
+        progress_bar=False,
+    )
+
+    bt.run(backtest)
+
+    # Concentration depends on relative invested exposure, not cash or leverage scale.
+    assert backtest.herfindahl_index.iloc[-1] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_herfindahl_index_preserves_exposure_at_zero_nav(nested):
+    dates = pd.date_range("2024-01-01", periods=2)
+    prices = pd.DataFrame({"a": [100.0, 50.0], "b": [100.0, 150.0]}, index=dates)
+
+    def make_strategy(name):
+        return bt.Strategy(
+            name,
+            [bt.algos.RunOnDate(dates[0]), bt.algos.WeighSpecified(a=1.0, b=-1.0), bt.algos.Rebalance()],
+        )
+
+    if nested:
+        strategy = bt.Strategy(
+            "root",
+            [bt.algos.RunOnce(), bt.algos.WeighSpecified(left=0.5, right=0.5), bt.algos.Rebalance()],
+            children=[make_strategy("left"), make_strategy("right")],
+        )
+    else:
+        strategy = make_strategy("root")
+    backtest = bt.Backtest(strategy, prices, initial_capital=100.0, integer_positions=False, progress_bar=False)
+
+    bt.run(backtest)
+
+    # Cash offsets net security value, but the exposures are still 50 and -150.
+    assert backtest.strategy.value == 0.0
+    assert backtest.herfindahl_index.loc[dates[0]] == pytest.approx(0.5)
+    assert backtest.herfindahl_index.loc[dates[1]] == pytest.approx(0.625)
+
+
+def test_herfindahl_index_is_undefined_without_security_exposure():
+    dates = pd.date_range("2024-01-01", periods=2)
+    prices = pd.DataFrame(100.0, index=dates, columns=["a", "b"])
+    strategy = bt.Strategy("cash_only")
+    backtest = bt.Backtest(strategy, prices, progress_bar=False)
+
+    bt.run(backtest)
+
+    assert backtest.herfindahl_index.index.equals(backtest.strategy.values.index)
+    assert backtest.herfindahl_index.isna().all()
+
+
+def test_herfindahl_index_matches_fixed_income_gross_exposure():
+    dates = pd.date_range("2024-01-01", periods=2)
+    prices = pd.DataFrame(100.0, index=dates, columns=["a", "b"])
+    weights = {"a": 2.0, "b": -1.0}
+    ordinary = bt.Backtest(
+        bt.Strategy(
+            "ordinary",
+            [
+                bt.algos.RunOnce(),
+                bt.algos.WeighSpecified(**weights),
+                bt.algos.Rebalance(),
+            ],
+        ),
+        prices,
+        integer_positions=False,
+        progress_bar=False,
+    )
+    fixed_income = bt.Backtest(
+        bt.FixedIncomeStrategy(
+            "fixed_income",
+            [
+                bt.algos.RunOnce(),
+                bt.algos.WeighSpecified(**weights),
+                bt.algos.SetNotional("notional"),
+                bt.algos.Rebalance(),
+            ],
+        ),
+        prices,
+        initial_capital=0,
+        integer_positions=False,
+        progress_bar=False,
+        additional_data={"notional": pd.Series(1_000_000.0, index=dates)},
+    )
+
+    bt.run(ordinary, fixed_income)
+
+    # Equivalent signed exposures must agree across value- and notional-weighted strategies.
+    assert ordinary.herfindahl_index.iloc[-1] == pytest.approx(5.0 / 9.0)
+    assert ordinary.herfindahl_index.iloc[-1] == pytest.approx(
+        fixed_income.herfindahl_index.iloc[-1]
+    )
+
+
+def test_nested_capital_flow_is_neutral_in_result():
+    dates = pd.date_range("2024-01-01", periods=3)
+    prices = pd.DataFrame({"asset": [100.0, 100.0, 100.0]}, index=dates)
+
+    def add_child_flow(target):
+        target["sleeve"].adjust(100.0)
+        return True
+
+    flat = bt.Backtest(
+        bt.Strategy(
+            "flat",
+            [bt.algos.RunOnce(), bt.algos.CapitalFlow(100.0)],
+        ),
+        prices,
+        initial_capital=1000.0,
+        progress_bar=False,
+    )
+    nested = bt.Backtest(
+        bt.Strategy(
+            "nested",
+            [bt.algos.RunOnce(), add_child_flow],
+            children=[bt.Strategy("sleeve")],
+        ),
+        prices,
+        initial_capital=1000.0,
+        progress_bar=False,
+    )
+
+    result = bt.run(flat, nested)
+
+    # Equivalent deposits must produce the same value, flow history, and zero return.
+    assert flat.strategy.value == nested.strategy.value == 1100.0
+    pd.testing.assert_series_equal(nested.strategy.flows, flat.strategy.flows)
+    pd.testing.assert_series_equal(
+        result.prices["nested"],
+        result.prices["flat"],
+        check_names=False,
+    )
+    assert result.stats.loc["total_return", "nested"] == pytest.approx(0.0)
+
+
+def test_can_disable_progress_bar_from_run():
+    from contextlib import redirect_stderr
+    from io import StringIO
+
+    # Create an in-memory buffer
+    output_capture = StringIO()
+
+    data = pd.DataFrame(
+        index=pd.date_range("2010-01-01", periods=5), columns=["a", "b"], data=100
+    )
+    s = bt.Strategy("test", [
+        bt.algos.SelectAll(),
+        bt.algos.WeighEqually(),
+        bt.algos.Rebalance()
+    ])
+
+    b = bt.Backtest(s, data)
+
+    # Redirect stderr to the buffer
+    with redirect_stderr(output_capture):
+        result = bt.run(b, progress_bar=False)
+
+    # confirm that the output is empty
+    assert output_capture.getvalue() is ""
+    # confirm that we actually ran something
+    assert  len(result.get_transactions()) > 0
+
+
+@pytest.mark.parametrize("missing_position", [0, 2, 3])
+@pytest.mark.parametrize("already_run", [False, True])
+def test_benchmark_random_preserves_partial_missing_dates(missing_position, already_run):
+    dates = pd.date_range("2020-01-01", periods=4)
+    data = pd.DataFrame(
+        {"a": [100.0, 150.0, 75.0, 100.0], "unused": 100.0},
+        index=dates,
+    )
+    data.loc[dates[missing_position], "unused"] = np.nan
+
+    # Both strategies select only a, so missing data for the unused asset cannot change returns.
+    def make_strategy(name: str) -> bt.Strategy:
+        return bt.Strategy(
+            name,
+            [
+                bt.algos.RunOnce(),
+                bt.algos.SelectThese(["a"]),
+                bt.algos.WeighEqually(),
+                bt.algos.Rebalance(),
+            ],
+        )
+
+    backtest = bt.Backtest(make_strategy("original"), data, progress_bar=False)
+    if already_run:
+        backtest.run()
+    original_data = backtest.data.copy(deep=True)
+    result = bt.backtest.benchmark_random(backtest, make_strategy("random"), nsim=2)
+
+    # Reconstructing a Backtest must replace only its synthetic row and preserve the real timeline.
+    pd.testing.assert_frame_equal(backtest.data, original_data)
+    expected_drawdown = 75.0 / 150.0 - 1.0
+    assert result.stats.loc["max_drawdown", "original"] == pytest.approx(expected_drawdown)
+    for name in ["random_0", "random_1"]:
+        pd.testing.assert_frame_equal(result.backtests[name].data, original_data)
+        assert result.stats.loc["max_drawdown", name] == pytest.approx(expected_drawdown)
+
+
+def test_benchmark_random_preserves_all_missing_dates():
+    dates = pd.date_range("2020-01-01", periods=5, tz="UTC")
+    data = pd.DataFrame({"a": [np.nan, 100.0, np.nan, 110.0, np.nan]}, index=dates)
+    # Stay in cash so an entirely missing real row does not require pricing a holding.
+    backtest = bt.Backtest(bt.Strategy("original"), data, progress_bar=False)
+    result = bt.backtest.benchmark_random(backtest, bt.Strategy("random"), nsim=2)
+
+    for name in ["original", "random_0", "random_1"]:
+        pd.testing.assert_frame_equal(result.backtests[name].data, backtest.data)
+        pd.testing.assert_index_equal(result.backtests[name].dates[1:], dates)
+
+
+def _make_benchmark_rebalance_strategy(name: str) -> bt.Strategy:
+    return bt.Strategy(
+        name,
+        [
+            bt.algos.RunOnce(),
+            bt.algos.SelectAll(),
+            bt.algos.WeighEqually(),
+            bt.algos.Rebalance(),
+        ],
+    )
+
+
+def _make_random_benchmark_result(tz=None):
+    dates = pd.date_range("2024-01-01", periods=4, tz=tz)
+    backtests = []
+    for name, prices in [
+        ("benchmark", [100.0, 200.0, 100.0, 110.0]),
+        ("random_a", [100.0, 50.0, 100.0, 120.0]),
+        ("random_b", [100.0, 100.0, 120.0, 90.0]),
+    ]:
+        backtest = bt.Backtest(
+            _make_benchmark_rebalance_strategy(name),
+            pd.DataFrame({"a": prices}, index=dates),
+            initial_capital=1000.0,
+            integer_positions=False,
+            progress_bar=False,
+        )
+        backtest.run()
+        backtests.append(backtest)
+    return dates, bt.backtest.RandomBenchmarkResult(*backtests)
+
+
+def test_random_benchmark_result_preserves_empty_input_error():
+    # Let GroupStats reject empty input before preparing any benchmark split.
+    with pytest.raises(ValueError, match="No objects to concatenate"):
+        bt.backtest.RandomBenchmarkResult()
+
+
+@pytest.mark.parametrize("tz", [None, "UTC"])
+def test_random_benchmark_statistics_follow_date_range(tz):
+    from matplotlib import pyplot as plt
+
+    plt.switch_backend("Agg")
+    dates, result = _make_random_benchmark_result(tz)
+    histories = [backtest.strategy.prices.copy(deep=True) for backtest in result.backtest_list]
+    # Ten shares per strategy give these endpoint ratios, independent of ffn's calculations.
+    for start, end, expected in [
+        (dates[1], dates[-1], [-0.45, 1.4, -0.1]),
+        (dates[0], dates[2], [0.0, 0.0, 0.2]),
+        (dates[-1], dates[-1], [np.nan, np.nan, np.nan]),
+        (None, None, [0.1, 0.2, -0.1]),
+    ]:
+        result.set_date_range(start=start, end=end)
+        np.testing.assert_allclose(result.b_stats["total_return"], expected[0], atol=1e-15)
+        np.testing.assert_allclose(
+            result.r_stats.loc["total_return"].astype(float), expected[1:], atol=1e-15
+        )
+        pd.testing.assert_series_equal(result.b_stats, result.stats["benchmark"])
+        pd.testing.assert_frame_equal(result.r_stats, result.stats[["random_a", "random_b"]])
+        if start == dates[1]:
+            # Check the actual comparison, not merely refreshed tables feeding a stale plot.
+            try:
+                figure, ax = plt.subplots()
+                result.plot_histogram("total_return", ax=ax, bins=4)
+                figure.canvas.draw()
+                heights, edges = np.histogram([1.4, -0.1], bins=4, density=True)
+                np.testing.assert_allclose(ax.lines[0].get_xdata(), [-0.45, -0.45])
+                np.testing.assert_allclose([patch.get_height() for patch in ax.patches], heights)
+                np.testing.assert_allclose([patch.get_x() for patch in ax.patches], edges[:-1])
+            finally:
+                plt.close("all")
+    for backtest, history in zip(result.backtest_list, histories):
+        pd.testing.assert_series_equal(backtest.strategy.prices, history)
+
+
+@pytest.mark.parametrize("riskfree_kind", ["annual", "prices"])
+def test_random_benchmark_statistics_follow_riskfree_rate(riskfree_kind):
+    _, result = _make_random_benchmark_result()
+    # Include the unchanged bootstrap-to-first-trade return of zero in each sample.
+    returns = np.array(
+        [[0.0, 1.0, -0.5, 0.1], [0.0, -0.5, 1.0, 0.2], [0.0, 0.0, 0.2, -0.25]]
+    )
+    if riskfree_kind == "annual":
+        riskfree = 0.06
+        excess = returns - ((1.06 ** (1.0 / 252)) - 1)
+    else:
+        riskfree = pd.Series([100.0, 100.1, 100.2, 100.3, 100.4], index=result.prices.index)
+        excess = returns - np.array(
+            [100.1 / 100 - 1, 100.2 / 100.1 - 1, 100.3 / 100.2 - 1, 100.4 / 100.3 - 1]
+        )
+    for rate, sample in [(riskfree, excess), (0.0, returns)]:
+        result.set_riskfree_rate(rate)
+        expected = sample.mean(axis=1) / sample.std(axis=1, ddof=1) * np.sqrt(252)
+        np.testing.assert_allclose(result.b_stats["daily_sharpe"], expected[0])
+        np.testing.assert_allclose(result.r_stats.loc["daily_sharpe"].astype(float), expected[1:])
+        pd.testing.assert_series_equal(result.b_stats, result.stats["benchmark"])
+        pd.testing.assert_frame_equal(result.r_stats, result.stats[["random_a", "random_b"]])
+
+
+def test_benchmark_random_statistics_follow_analysis_updates():
+    dates = pd.date_range("2024-01-01", periods=4)
+    backtest = bt.Backtest(
+        _make_benchmark_rebalance_strategy("original"),
+        pd.DataFrame({"a": [100.0, 200.0, 100.0, 110.0]}, index=dates),
+        initial_capital=1000.0,
+        integer_positions=False,
+        progress_bar=False,
+    )
+    result = bt.backtest.benchmark_random(backtest, _make_benchmark_rebalance_strategy("random"), nsim=2)
+    result.set_date_range(start=dates[1])
+    # The public wrapper renames controls; all three still hold the same ten shares.
+    assert result.b_stats["total_return"] == pytest.approx(-0.45)
+    np.testing.assert_allclose(result.r_stats.loc["total_return"].astype(float), [-0.45, -0.45])
+    assert list(result.r_stats.columns) == ["random_0", "random_1"]
+    result.set_riskfree_rate(0.06)
+    assert result.b_stats["rf"] == 0.06
+    np.testing.assert_allclose(result.r_stats.loc["rf"].astype(float), [0.06, 0.06])
+
+
+@pytest.mark.parametrize("supplied_axes", [False, True])
+@pytest.mark.parametrize(
+    "samples, expected_kde",
+    [
+        ([0.1], False),
+        ([0.1, 0.1], False),
+        ([np.nan, 0.1], False),
+        ([np.nan, 0.1, 0.1], False),
+        ([0.1, 0.2], True),
+        ([np.nan, 0.1, 0.2], True),
+    ],
+)
+def test_random_benchmark_histogram_effective_sample(samples, expected_kde, supplied_axes):
+    from matplotlib import pyplot as plt
+    from matplotlib.colors import to_rgba
+    from scipy.stats import gaussian_kde
+
+    # Render without depending on a GUI toolkit being available on CI runners.
+    plt.switch_backend("Agg")
+
+    # Isolate the plotting owner with known statistics, independently of ffn's estimators.
+    result = bt.backtest.RandomBenchmarkResult.__new__(bt.backtest.RandomBenchmarkResult)
+    result.r_stats = pd.DataFrame([samples], index=["total_return"], dtype=float)
+    result.b_stats = pd.Series({"total_return": 0.15})
+    original_stats = result.r_stats.copy(deep=True)
+    finite_samples = [value for value in samples if not np.isnan(value)]
+    expected_heights, expected_edges = np.histogram(finite_samples, bins=4, density=True)
+
+    try:
+        kwargs = {}
+        if supplied_axes:
+            figure, (ax, neighbor) = plt.subplots(1, 2)
+            (sentinel,) = neighbor.plot([0, 1], [2, 3])
+            # The caller's subplot need not belong to pyplot's current figure.
+            unrelated = plt.figure()
+            kwargs["ax"] = ax
+        figures_before = set(plt.get_fignums())
+        assert result.plot_histogram("total_return", bins=4, title="Comparison", color="green", **kwargs) is None
+        if supplied_axes:
+            assert set(plt.get_fignums()) == figures_before
+            assert ax.figure is figure
+            assert not neighbor.patches
+            assert list(neighbor.lines) == [sentinel]
+            assert not unrelated.axes
+        else:
+            ax = plt.gca()
+            assert len(set(plt.get_fignums()) - figures_before) == 1
+        np.testing.assert_allclose(ax.figure.get_size_inches(), [15, 5])
+        # Drawing the canvas catches failures that artist creation can defer.
+        ax.figure.canvas.draw()
+        assert ax.get_title() == "Comparison"
+        np.testing.assert_allclose([patch.get_height() for patch in ax.patches], expected_heights)
+        np.testing.assert_allclose([patch.get_x() for patch in ax.patches], expected_edges[:-1])
+        np.testing.assert_allclose([patch.get_width() for patch in ax.patches], np.diff(expected_edges))
+        assert all(patch.get_facecolor() == to_rgba("green") for patch in ax.patches)
+        np.testing.assert_allclose(ax.lines[0].get_xdata(), [0.15, 0.15])
+        assert ax.lines[0].get_color() == "r"
+        assert len(ax.lines) == (2 if expected_kde else 1)
+        if expected_kde:
+            # Check the actual density curve, not just the presence of another line.
+            line = ax.lines[1]
+            np.testing.assert_allclose(line.get_ydata(), gaussian_kde(finite_samples)(line.get_xdata()))
+        pd.testing.assert_frame_equal(result.r_stats, original_stats)
+    finally:
+        plt.close("all")
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_random_benchmark_histogram_completed_result_axes(grouped):
+    from matplotlib import pyplot as plt
+
+    plt.switch_backend("Agg")
+    backtests = []
+    for name, final_price in [("benchmark", 105.0), ("random_a", 103.0), ("random_b", 100.0)]:
+        strategy = _make_benchmark_rebalance_strategy(name)
+        data = pd.DataFrame({"a": [100.0, final_price]}, index=pd.date_range("2024-01-01", periods=2))
+        backtest = bt.Backtest(strategy, data, initial_capital=1000.0, progress_bar=False)
+        backtest.run()
+        backtests.append(backtest)
+    result = bt.backtest.RandomBenchmarkResult(*backtests)
+    # Each portfolio buys ten shares at 100: returns are .05, .03 and zero.
+    np.testing.assert_allclose(result.r_stats.loc["total_return"].astype(float), [0.03, 0.0], atol=1e-15)
+    assert result.b_stats["total_return"] == pytest.approx(0.05)
+    try:
+        figure, ax = plt.subplots()
+        unrelated = plt.figure()
+        figures_before = set(plt.get_fignums())
+        # pandas' grouped histogram already owns its supplied figure; do not
+        # pass its ungrouped-only figure keyword down that separate branch.
+        kwargs = {"by": ["one", "one"]} if grouped else {}
+        assert result.plot_histogram("total_return", ax=ax, bins=4, **kwargs) is None
+        figure.canvas.draw()
+        assert set(plt.get_fignums()) == figures_before
+        assert not unrelated.axes
+        assert len(ax.patches) == 4
+        assert ax.get_title() == "total_return histogram"
+        np.testing.assert_allclose(ax.lines[0].get_xdata(), [0.05, 0.05])
+        assert len(ax.lines) == 2
+    finally:
+        plt.close("all")
+
+
+@pytest.mark.parametrize("samples", [[], [np.nan, np.nan]])
+def test_random_benchmark_histogram_preserves_empty_sample_error(samples):
+    from matplotlib import pyplot as plt
+
+    # Render without depending on a GUI toolkit being available on CI runners.
+    plt.switch_backend("Agg")
+
+    result = bt.backtest.RandomBenchmarkResult.__new__(bt.backtest.RandomBenchmarkResult)
+    result.r_stats = pd.DataFrame([samples], index=["total_return"], dtype=float)
+    result.b_stats = pd.Series({"total_return": 0.15})
+    try:
+        # No observations is distinct from a constant sample; retain pandas' rejection.
+        with pytest.raises(ValueError):
+            result.plot_histogram("total_return")
+    finally:
+        plt.close("all")
+
+
+@pytest.mark.parametrize("as_series", [False, True], ids=["dataframe", "series"])
+def test_benchmark_random_preserves_additional_data(as_series: bool):
+    dates = pd.date_range("2020-01-01", periods=3)
+    data = pd.DataFrame({"a": 100.0}, index=dates)
+    signal = pd.Series([1.0, 2.0, 3.0], index=dates, name="signal")
+    if not as_series:
+        signal = signal.to_frame()
+    original_signal = signal.copy(deep=True)
+
+    # Exercise the public named-data lookup from both supported container paths.
+    def record_signal(target: bt.Strategy) -> bool:
+        target.get_data("signal")
+        target.perm["signal_loaded"] = True
+        return True
+
+    backtest = bt.Backtest(
+        bt.Strategy("original", [record_signal]),
+        data,
+        additional_data={"signal": signal},
+        progress_bar=False,
+    )
+    result = bt.backtest.benchmark_random(backtest, bt.Strategy("random", [record_signal]), nsim=1)
+
+    # The reconstructed control must expose the named value without mutating caller data.
+    random_backtest = result.backtests["random_0"]
+    assert random_backtest.strategy.perm["signal_loaded"] is True
+    assert signal.equals(original_signal)
+
+
+@pytest.mark.parametrize("fee", [0.0, 10.0])
+def test_benchmark_random_preserves_legacy_configuration(fee):
+    dates = pd.date_range("2020-01-01", periods=3)
+    data = pd.DataFrame({"a": 100.0}, index=dates)
+
+    backtest = bt.Backtest(
+        _make_benchmark_rebalance_strategy("original"),
+        data,
+        initial_capital=1_000.0,
+        commissions=None if fee == 0.0 else lambda quantity, price: fee,
+        integer_positions=False,
+        progress_bar=False,
+    )
+    random_strategy = _make_benchmark_rebalance_strategy("random")
+    random_strategy.set_commissions(lambda quantity, price: 25.0)
+    result = bt.backtest.benchmark_random(backtest, random_strategy, nsim=1)
+    random_backtest = result.backtests["random_0"]
+
+    # A full allocation at 100 pays the original fee, not the random template's fee.
+    assert random_backtest.initial_capital == 1_000.0
+    assert random_backtest.strategy.integer_positions is False
+    assert random_backtest.strategy["a"].position == pytest.approx((1000.0 - fee) / 100.0)
+    assert random_backtest.strategy.fees.sum() == pytest.approx(fee)
+    assert random_backtest.strategy.value == pytest.approx(1000.0 - fee)
+    assert random_strategy.commission_fn(1, 100) == 25.0
+    if fee == 0.0:
+        assert random_backtest.strategy.commission_fn.__self__ is random_backtest.strategy
+
+
+@pytest.mark.parametrize("as_series", [False, True], ids=["dataframe", "series"])
+def test_benchmark_random_isolates_additional_data(as_series):
+    dates = pd.date_range("2020-01-01", periods=3)
+    data = pd.DataFrame({"a": 100.0}, index=dates)
+    signal = pd.Series(0.0, index=dates, name="signal")
+    if not as_series:
+        signal = signal.to_frame()
+    backtest = bt.Backtest(
+        bt.Strategy("original"), data, additional_data={"signal": signal, "state": {"count": 0}}
+    )
+    original_signal = backtest.additional_data["signal"].copy(deep=True)
+
+    def update_inputs(target):
+        target.get_data("signal").loc[target.now] += 1.0
+        target.get_data("state")["count"] += 1
+        return True
+
+    result = bt.backtest.benchmark_random(backtest, bt.Strategy("random", [update_inputs]), nsim=2)
+
+    assert backtest.additional_data["signal"].equals(original_signal)
+    assert backtest.additional_data["state"]["count"] == 0
+    for name in ["random_0", "random_1"]:
+        control = result.backtests[name]
+        assert (control.additional_data["signal"].loc[dates].to_numpy() == 1.0).all()
+        assert control.additional_data["state"]["count"] == len(dates)
+
+
+def test_benchmark_random_preserves_cost_model_configuration():
+    dates = pd.date_range("2020-01-01", periods=3)
+    data = pd.DataFrame({"a": 100.0}, index=dates)
+    volume = pd.DataFrame({"a": 1_000.0}, index=dates)
+    volatility = pd.DataFrame({"a": 0.2}, index=dates)
+    original_volume = volume.copy(deep=True)
+    original_volatility = volatility.copy(deep=True)
+    alpha, beta, epsilon = 2.0, 3.0, 0.01
+    cost_model = bt.AlmgrenChrissCostModel(alpha=alpha, beta=beta, epsilon=epsilon)
+
+    backtest = bt.Backtest(
+        _make_benchmark_rebalance_strategy("original"),
+        data,
+        initial_capital=1_000.0,
+        commissions=cost_model,
+        integer_positions=False,
+        volume=volume,
+        volatility=volatility,
+        progress_bar=False,
+    )
+    result = bt.backtest.benchmark_random(backtest, _make_benchmark_rebalance_strategy("random"), nsim=1)
+    random_backtest = result.backtests["random_0"]
+
+    # Solve capital = price * quantity + documented Almgren-Chriss cost independently.
+    price = 100.0
+    impact = (0.5 * alpha + beta) * 0.2 * price / 1_000.0
+    linear = price * (1.0 + epsilon)
+    expected_position = 2_000.0 / (linear + np.sqrt(linear**2 + 4.0 * impact * 1_000.0))
+    expected_fee = 1_000.0 - price * expected_position
+
+    # Both impact inputs and their downstream numerical effects must match the source Backtest.
+    assert random_backtest.initial_capital == 1_000.0
+    assert random_backtest.strategy.integer_positions is False
+    assert isinstance(random_backtest.cost_model, bt.AlmgrenChrissCostModel)
+    assert random_backtest.strategy["a"].position == pytest.approx(expected_position)
+    assert random_backtest.strategy.fees.sum() == pytest.approx(expected_fee)
+    assert random_backtest.strategy.value == pytest.approx(1_000.0 - expected_fee)
+    pd.testing.assert_frame_equal(volume, original_volume)
+    pd.testing.assert_frame_equal(volatility, original_volatility)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("lazy", [False, True])
+def test_backtest_weight_reports_stay_current_during_run(nested, lazy):
+    dates = pd.date_range("2020-01-01", periods=3)
+    data = pd.DataFrame({"a": [100.0, 120.0, 80.0]}, index=dates)
+    holder = {}
+    observations = []
+
+    class Observe(bt.Algo):
+        def __init__(self, phase):
+            super().__init__()
+            self.phase = phase
+
+        def __call__(self, target):
+            backtest = holder["backtest"]
+            # Paper sleeves run separately; only the real portfolio is being observed.
+            if target.root is not backtest.strategy:
+                return True
+            observations.append(
+                (target.name, self.phase, target.now, backtest.weights, backtest.security_weights)
+            )
+            return True
+
+    def make_backtest(observe):
+        def trading_algos():
+            algos = [
+                bt.algos.RunOnce(),
+                bt.algos.SelectAll(),
+                bt.algos.WeighEqually(),
+                bt.algos.Rebalance(),
+            ]
+            if observe:
+                algos = [Observe("before"), *algos, bt.algos.run_always(Observe("after"))]
+            return algos
+
+        children = ["a"] if lazy else [bt.Security("a")]
+        if nested:
+            children = [bt.Strategy("sleeve", trading_algos(), children=children)]
+        algos = trading_algos()
+        return bt.Backtest(bt.Strategy("root", algos, children=children), data, initial_capital=1000.0)
+
+    observed = make_backtest(True)
+    holder["backtest"] = observed
+    result = bt.run(observed)
+    control = make_backtest(False)
+    bt.run(control)
+
+    # Observing reports must not change trades: 1000 / 100 buys ten shares.
+    pd.testing.assert_frame_equal(observed.positions, control.positions)
+    pd.testing.assert_series_equal(observed.strategy.values, control.strategy.values)
+    np.testing.assert_allclose(observed.strategy.values, [1000.0, 1000.0, 1200.0, 800.0])
+    assert observed.strategy.securities[0].position == 10.0
+    assert len(observations) == (12 if nested else 6)
+    for owner, phase, date, weights, security_weights in observations:
+        expected_dates = observed.dates[:observed.dates.get_loc(date) + 1]
+        pd.testing.assert_index_equal(weights.index, expected_dates)
+        pd.testing.assert_index_equal(security_weights.index, expected_dates)
+        # A parent's stack finishes before its children trade. On the first date,
+        # only the leaf owner's post-rebalance read has exposure: 10*p / (10*p) = 1.
+        before_first_trade = date == dates[0] and (phase == "before" or (nested and owner == "root"))
+        expected_weight = 0.0 if before_first_trade else 1.0
+        component = "root>sleeve>a" if nested else "root>a"
+        if component in weights:
+            assert weights.loc[date, component] == pytest.approx(expected_weight)
+        else:
+            assert expected_weight == 0.0
+        if "a" in security_weights:
+            assert security_weights.loc[date, "a"] == pytest.approx(expected_weight)
+        else:
+            assert expected_weight == 0.0
+
+    pd.testing.assert_frame_equal(observed.weights, control.weights)
+    pd.testing.assert_frame_equal(observed.security_weights, control.security_weights)
+    pd.testing.assert_frame_equal(result.get_weights(), control.weights)
+    pd.testing.assert_frame_equal(result.get_security_weights(), control.security_weights)
+    # Completed reports still reuse the same cached objects through Result delegation.
+    assert result.get_weights() is observed.weights
+    assert result.get_security_weights() is observed.security_weights
 
 
 def test_Results_helper_functions():
 
-    names = ['foo', 'bar']
-    dates = pd.date_range(start='2017-01-01', end='2017-12-31', freq=pd.tseries.offsets.BDay())
-    n = len(dates)
-    rdf = pd.DataFrame(
-        np.zeros((n, len(names))),
-        index=dates,
-        columns=names
+    names = ["foo", "bar"]
+    dates = pd.date_range(
+        start="2017-01-01", end="2017-12-31", freq=pd.tseries.offsets.BDay()
     )
+    n = len(dates)
+    rdf = pd.DataFrame(np.zeros((n, len(names))), index=dates, columns=names)
 
     np.random.seed(1)
     rdf[names[0]] = np.random.normal(loc=0.1 / n, scale=0.2 / np.sqrt(n), size=n)
@@ -123,9 +912,7 @@ def test_Results_helper_functions():
     pdf = 100 * np.cumprod(1 + rdf)
 
     # algo to fire on the beginning of every month and to run on the first date
-    runDailyAlgo = bt.algos.RunDaily(
-        run_on_first_date=True
-    )
+    runDailyAlgo = bt.algos.RunDaily(run_on_first_date=True)
 
     # algo to set the weights
     #  it will only run when runMonthlyAlgo returns true
@@ -139,63 +926,73 @@ def test_Results_helper_functions():
     rebalAlgo = bt.algos.Rebalance()
 
     # a strategy that rebalances monthly to specified weights
-    strat = bt.Strategy('static',
-        [
-            runDailyAlgo,
-            weighSpecifiedAlgo,
-            rebalAlgo
-        ]
-    )
+    strat = bt.Strategy("static", [runDailyAlgo, weighSpecifiedAlgo, rebalAlgo])
 
-    backtest = bt.Backtest(
-        strat,
-        pdf,
-        integer_positions=False,
-        progress_bar=False
-    )
+    backtest = bt.Backtest(strat, pdf, integer_positions=False, progress_bar=False)
 
     res = bt.run(backtest)
 
-    assert(type(res.get_security_weights()) is pd.DataFrame)
+    assert type(res.get_security_weights()) is pd.DataFrame
 
-    assert (type(res.get_transactions()) is pd.DataFrame)
+    assert type(res.get_transactions()) is pd.DataFrame
 
-    assert (type(res.get_weights()) is pd.DataFrame)
+    assert type(res.get_weights()) is pd.DataFrame
+
+
+def test_get_monthly_max_drawdown():
+    dates = pd.to_datetime(["2020-01-31", "2020-02-14", "2020-02-28", "2020-03-15"])
+    data = pd.DataFrame({"asset": [100.0, 50.0, 90.0, 80.0]}, index=dates)
+    strategy = bt.Strategy(
+        "strategy",
+        [bt.algos.RunOnce(), bt.algos.SelectAll(), bt.algos.WeighEqually(), bt.algos.Rebalance()],
+    )
+    second_data = pd.DataFrame({"asset": [100.0, 90.0, 110.0, 99.0]}, index=dates)
+    second_strategy = bt.Strategy(
+        "second",
+        [bt.algos.RunOnce(), bt.algos.SelectAll(), bt.algos.WeighEqually(), bt.algos.Rebalance()],
+    )
+
+    result = bt.run(
+        bt.Backtest(strategy, data, progress_bar=False),
+        bt.Backtest(second_strategy, second_data, progress_bar=False),
+    )
+
+    assert result["strategy"].max_drawdown == pytest.approx(-0.5)
+    pd.testing.assert_series_equal(
+        result.get_monthly_max_drawdown(),
+        pd.Series({"strategy": -0.2, "second": -0.1}, name="monthly_max_drawdown"),
+    )
 
 
 def test_Results_helper_functions_fi():
 
-    names = ['foo', 'bar']
-    dates = pd.date_range(start='2017-01-01', end='2017-12-31', freq=pd.tseries.offsets.BDay())
-    n = len(dates)
-    rdf = pd.DataFrame(
-        np.zeros((n, len(names))),
-        index=dates,
-        columns=names
+    names = ["foo", "bar"]
+    dates = pd.date_range(
+        start="2017-01-01", end="2017-12-31", freq=pd.tseries.offsets.BDay()
     )
+    n = len(dates)
+    rdf = pd.DataFrame(np.zeros((n, len(names))), index=dates, columns=names)
 
     np.random.seed(1)
     rdf[names[0]] = np.random.normal(loc=0.1 / n, scale=0.2 / np.sqrt(n), size=n)
     rdf[names[1]] = np.random.normal(loc=0.04 / n, scale=0.05 / np.sqrt(n), size=n)
 
     pdf = 100 * np.cumprod(1 + rdf)
-    notional = pd.Series( 1e6, index = pdf.index )
-    
+    notional = pd.Series(1e6, index=pdf.index)
+
     # algo to fire on the beginning of every month and to run on the first date
-    runDailyAlgo = bt.algos.RunDaily(
-        run_on_first_date=True
-    )
+    runDailyAlgo = bt.algos.RunDaily(run_on_first_date=True)
 
     # algo to select all securities
     selectAll = bt.algos.SelectAll()
 
     # algo to set the weights
     #  it will only run when runMonthlyAlgo returns true
-    #  which only happens on the first of every month        
+    #  which only happens on the first of every month
     weighRandomly = bt.algos.WeighRandomly()
 
     # algo to set the notional of the fixed income strategy
-    setNotional = bt.algos.SetNotional( 'notional' )
+    setNotional = bt.algos.SetNotional("notional")
 
     # algo to rebalance the current weights to weights set by weighSpecified
     #  will only run when weighSpecifiedAlgo returns true
@@ -203,65 +1000,228 @@ def test_Results_helper_functions_fi():
     rebalAlgo = bt.algos.Rebalance()
 
     # a strategy that rebalances monthly to specified weights
-    strat = bt.FixedIncomeStrategy('random',
-        [
-            runDailyAlgo,
-            selectAll,
-            weighRandomly,
-            setNotional,
-            rebalAlgo
-        ]
+    strat = bt.FixedIncomeStrategy(
+        "random", [runDailyAlgo, selectAll, weighRandomly, setNotional, rebalAlgo]
     )
 
     backtest = bt.Backtest(
         strat,
         pdf,
-        initial_capital = 0,
+        initial_capital=0,
         integer_positions=False,
         progress_bar=False,
-        additional_data = {'mydata':pdf, 'notional':notional}
+        additional_data={"mydata": pdf, "notional": notional},
     )
-    bidoffer = 1.
+    bidoffer = 1.0
     backtest2 = bt.Backtest(
         strat,
         pdf,
-        initial_capital = 0,
+        initial_capital=0,
         integer_positions=False,
         progress_bar=False,
-        additional_data = {'mydata':pdf, 
-                           'notional':notional,
-                           'bidoffer': pd.DataFrame( bidoffer, pdf.index, pdf.columns )}
+        additional_data={
+            "mydata": pdf,
+            "notional": notional,
+            "bidoffer": pd.DataFrame(bidoffer, pdf.index, pdf.columns),
+        },
     )
     random.seed(1234)
     res = bt.run(backtest)
     random.seed(1234)
     res2 = bt.run(backtest2)
 
-    assert(type(res.get_security_weights()) is pd.DataFrame)
+    assert type(res.get_security_weights()) is pd.DataFrame
 
-    assert (type(res.get_transactions()) is pd.DataFrame)
+    assert type(res.get_transactions()) is pd.DataFrame
     assert len(res.get_transactions()) > 0
 
-    assert (type(res.get_weights()) is pd.DataFrame)
+    assert type(res.get_weights()) is pd.DataFrame
 
     # Make sure the insertion of the first row applies to additional data as well
-    assert backtest.data.index.equals( backtest.additional_data['mydata'].index )
+    assert backtest.data.index.equals(backtest.additional_data["mydata"].index)
 
     # Check that bid/offer is accounted for
-    transactions = res.get_transactions()        
-    transactions['price'] = transactions['price'] + 0.5 * bidoffer
-    assert (res2.get_transactions().price - res2.get_transactions().price).abs().sum() == 0
-        
-        
-def test_30_min_data():
-    names = ['foo']
-    dates = pd.date_range(start='2017-01-01', end='2017-12-31', freq='30min')
+    transactions = res.get_transactions()
+    transactions["price"] = transactions["price"] + 0.5 * bidoffer
+    assert (
+        res2.get_transactions().price - res2.get_transactions().price
+    ).abs().sum() == 0
+
+
+def test_nested_strategy_backtest_handles_initial_paper_trade_value():
+    names = ["foo", "bar", "rf"]
+    dates = pd.date_range("2017-01-01", "2017-12-31", freq=pd.tseries.offsets.BDay())
     n = len(dates)
-    rdf = pd.DataFrame(
-        np.zeros((n, len(names))),
-        index=dates,
-        columns=names
+    returns = pd.DataFrame(np.zeros((n, len(names))), index=dates, columns=names)
+
+    np.random.seed(1)
+    returns["foo"] = np.random.normal(loc=0.1 / n, scale=0.2 / np.sqrt(n), size=n)
+    returns["bar"] = np.random.normal(loc=0.04 / n, scale=0.05 / np.sqrt(n), size=n)
+    returns["rf"] = 0.0
+
+    prices = 100 * np.cumprod(1 + returns)
+
+    weights = pd.Series([0.6, 0.2, 0.1], index=returns.columns)
+    leaf = bt.Strategy(
+        "leaf",
+        [
+            bt.algos.RunMonthly(run_on_first_date=True),
+            bt.algos.WeighSpecified(**weights),
+            bt.algos.Rebalance(),
+        ],
     )
+    middle = bt.Strategy(
+        "middle",
+        [
+            bt.algos.RunMonthly(run_on_first_date=True),
+            bt.algos.SelectAll(),
+            bt.algos.WeighEqually(),
+            bt.algos.Rebalance(),
+        ],
+        children=[leaf, "foo"],
+    )
+    root = bt.Strategy(
+        "root",
+        [
+            bt.algos.RunMonthly(run_on_first_date=True),
+            bt.algos.SelectAll(),
+            bt.algos.WeighEqually(),
+            bt.algos.Rebalance(),
+        ],
+        children=[middle, "bar"],
+    )
+
+    backtest = bt.Backtest(root, prices, integer_positions=False, progress_bar=False)
+
+    result = bt.run(backtest)
+
+    assert isinstance(result.prices, pd.DataFrame)
+    assert np.isfinite(result.prices["root"]).all()
+    assert result.prices["root"].iloc[0] == 100
+
+
+@pytest.mark.parametrize(
+    ("invalid_price", "multiplier", "message"),
+    [
+        pytest.param(np.inf, 1.0, "Price is infinite", id="infinite-price"),
+        pytest.param(np.finfo(float).max, 2.0, "non-finite value", id="derived-overflow"),
+    ],
+)
+def test_backtest_rejects_nonfinite_value_before_result_construction(
+    invalid_price,
+    multiplier,
+    message,
+):
+    dates = pd.date_range("2026-01-01", periods=3)
+    prices = pd.DataFrame({"asset": [100.0, invalid_price, 110.0]}, index=dates)
+    strategy = bt.Strategy(
+        "strategy",
+        [
+            bt.algos.RunOnce(),
+            bt.algos.SelectAll(),
+            bt.algos.WeighEqually(),
+            bt.algos.Rebalance(),
+        ],
+        children=[bt.Security("asset", multiplier=multiplier)],
+    )
+    backtest = bt.Backtest(
+        strategy,
+        prices,
+        integer_positions=False,
+        progress_bar=False,
+    )
+
+    # Rejection must precede invalid portfolio arithmetic and result construction.
+    with pytest.raises(ValueError, match=message), np.errstate(all="raise"):
+        backtest.run()
+
+    assert backtest.strategy["asset"].now == dates[0]
+    assert np.isfinite(backtest.strategy["asset"]._value)
+    assert backtest._stat_prices is None
+    assert backtest.stats == {}
+
+
+@pytest.mark.parametrize(
+    ("position_values", "expected_start", "duplicate_dates"),
+    [
+        pytest.param(([0, 0, 1, 1], [0, 1, 1, 1]), 0, False, id="initial"),
+        pytest.param(([0, 0, 0, 1], [0, 0, 1, 1]), 1, False, id="delayed"),
+        pytest.param(([0, 0, 0, 0], [0, 0, 0, 0]), 0, False, id="absent"),
+        pytest.param(([0, 1, 1, 1], [0, 0, 1, 1]), 0, True, id="duplicate-date"),
+    ],
+)
+def test_compute_stat_prices_preserves_first_transaction_window(
+    position_values,
+    expected_start,
+    duplicate_dates,
+):
+    dates = (
+        pd.DatetimeIndex(["2025-12-31", "2026-01-01", "2026-01-01", "2026-01-02"])
+        if duplicate_dates
+        else pd.date_range("2026-01-01", periods=4)
+    )
+    prices = pd.Series(np.arange(len(dates), dtype=float) + 100.0, index=dates)
+    securities = [mock.Mock(positions=pd.Series(values, index=dates)) for values in position_values]
+    backtest = mock.Mock(strategy=mock.Mock(prices=prices, securities=securities))
+
+    actual = bt.Backtest._compute_stat_prices(backtest)
+
+    pd.testing.assert_series_equal(actual, prices.iloc[expected_start:])
+
+
+def test_compute_stat_prices_stops_at_first_tradable_date():
+    dates = pd.date_range("2026-01-01", periods=4)
+    prices = pd.Series(np.arange(len(dates), dtype=float) + 100.0, index=dates)
+    initial = mock.Mock(positions=pd.Series([0, 1, 1, 1], index=dates))
+    unvisited = mock.Mock()
+    unvisited_positions = mock.PropertyMock(side_effect=AssertionError("scanned past lower bound"))
+    type(unvisited).positions = unvisited_positions
+    backtest = mock.Mock(strategy=mock.Mock(prices=prices, securities=[initial, unvisited]))
+
+    # Trading cannot precede the first date after the bootstrap row.
+    actual = bt.Backtest._compute_stat_prices(backtest)
+
+    pd.testing.assert_series_equal(actual, prices)
+    unvisited_positions.assert_not_called()
+
+
+def test_run_after_date_stats_include_first_transaction():
+    dates = pd.date_range("2000-01-01", "2002-12-31", freq=pd.tseries.offsets.BDay())
+    prices = pd.DataFrame(index=dates, data={"a": 100.0})
+    prices.loc[dates[260]:, "a"] = np.linspace(100, 150, len(dates[260:]))
+
+    strategy = bt.Strategy(
+        "delayed",
+        [
+            bt.algos.RunAfterDate("2001-01-01"),
+            bt.algos.SelectAll(),
+            bt.algos.WeighEqually(),
+            bt.algos.Rebalance(),
+        ],
+    )
+
+    result = bt.run(
+        bt.Backtest(
+            strategy,
+            prices,
+            commissions=lambda q, p: 100.0,
+            progress_bar=False,
+        )
+    )
+
+    first_transaction_date = result.get_transactions().index.get_level_values(0)[0]
+    first_transaction_position = result.backtests["delayed"].strategy.prices.index.get_loc(first_transaction_date)
+    stats_start = result.backtests["delayed"].strategy.prices.index[first_transaction_position - 1]
+    assert result.stats["delayed"].start == stats_start
+    assert result.prices.index[0] == stats_start
+    assert result.prices.loc[first_transaction_date, "delayed"] < result.prices.loc[stats_start, "delayed"]
+
+
+def test_30_min_data():
+    names = ["foo"]
+    dates = pd.date_range(start="2017-01-01", end="2017-12-31", freq="30min")
+    n = len(dates)
+    rdf = pd.DataFrame(np.zeros((n, len(names))), index=dates, columns=names)
 
     np.random.seed(1)
     rdf[names[0]] = np.random.normal(loc=0.1 / n, scale=0.2 / np.sqrt(n), size=n)
@@ -276,67 +1236,1044 @@ def test_30_min_data():
     tw[sma50 <= sma200] = -1.0
     tw[sma200.isnull()] = 0.0
 
-    ma_cross = bt.Strategy('ma_cross', [bt.algos.WeighTarget(tw), bt.algos.Rebalance()])
-    t = bt.Backtest(ma_cross, pdf,progress_bar=False)
+    ma_cross = bt.Strategy("ma_cross", [bt.algos.WeighTarget(tw), bt.algos.Rebalance()])
+    t = bt.Backtest(ma_cross, pdf, progress_bar=False)
     res = bt.run(t)
 
-    wait=1
+    wait = 1
 
 
 def test_RenomalizedFixedIncomeResult():
-    dts = pd.date_range('2010-01-01', periods=5)
-    data = pd.DataFrame(index=dts, columns=['a'], data=1.)    
-    data['a'][dts[0]] = 0.99
-    data['a'][dts[1]] = 1.01
-    data['a'][dts[2]] = 0.99
-    data['a'][dts[3]] = 1.01
-    data['a'][dts[4]] = 0.99
-    
-    weights = pd.DataFrame(index=dts, columns=['a'], data=1.)
-    weights['a'][dts[0]] = 1.
-    weights['a'][dts[1]] = 2.
-    weights['a'][dts[2]] = 1.
-    weights['a'][dts[3]] = 2.
-    weights['a'][dts[4]] = 1.
-    
-    coupons = pd.DataFrame(index=dts, columns=['a'], data=0.)
-    
-    algos = [ bt.algos.SelectAll(),
-              bt.algos.WeighTarget( weights ),
-              bt.algos.SetNotional( 'notional' ),
-              bt.algos.Rebalance()]
-    children = [ bt.CouponPayingSecurity('a') ]
-    
-    s = bt.FixedIncomeStrategy('s', algos, children = children )
+    dts = pd.date_range("2010-01-01", periods=5)
+    data = pd.DataFrame(index=dts, columns=["a"], data=1.0)
+    data.loc[dts[0], "a"] = 0.99
+    data.loc[dts[1], "a"] = 1.01
+    data.loc[dts[2], "a"] = 0.99
+    data.loc[dts[3], "a"] = 1.01
+    data.loc[dts[4], "a"] = 0.99
 
-    t = bt.Backtest(s, data, initial_capital=0, 
-                    additional_data = {'notional': pd.Series( 1e6, dts),
-                                       'coupons': coupons},
-                    progress_bar=False)
+    weights = pd.DataFrame(index=dts, columns=["a"], data=1.0)
+    weights.loc[dts[0], "a"] = 1.0
+    weights.loc[dts[1], "a"] = 2.0
+    weights.loc[dts[2], "a"] = 1.0
+    weights.loc[dts[3], "a"] = 2.0
+    weights.loc[dts[4], "a"] = 1.0
+
+    coupons = pd.DataFrame(index=dts, columns=["a"], data=0.0)
+
+    algos = [
+        bt.algos.SelectAll(),
+        bt.algos.WeighTarget(weights),
+        bt.algos.SetNotional("notional"),
+        bt.algos.Rebalance(),
+    ]
+    children = [bt.CouponPayingSecurity("a")]
+
+    s = bt.FixedIncomeStrategy("s", algos, children=children)
+
+    t = bt.Backtest(
+        s,
+        data,
+        initial_capital=0,
+        additional_data={"notional": pd.Series(1e6, dts), "coupons": coupons},
+        progress_bar=False,
+    )
     res = bt.run(t)
 
-    t = res.backtests['s']
-    
+    t = res.backtests["s"]
+
     # Due to the relationship between the time varying notional and the prices,
     # the strategy has lost money, but price == 100, so "total return" is zero
-    assert t.strategy.value < 0.
-    assert t.strategy.price == 100.
-    assert res.stats['s'].total_return == 0
-    
+    assert t.strategy.value < 0.0
+    assert t.strategy.price == pytest.approx(100.0)
+    assert res.stats["s"].total_return == 0
+
     # Renormalizing results to a constant size "fixes" this
-    norm_res = bt.backtest.RenormalizedFixedIncomeResult( 1e6, *res.backtest_list )    
-    aae( norm_res.stats['s'].total_return, t.strategy.value / 1e6, 16 )
-    
+    norm_res = bt.backtest.RenormalizedFixedIncomeResult(1e6, *res.backtest_list)
+    assert norm_res.stats["s"].total_return == pytest.approx(t.strategy.value / 1e6, 16)
+
     # Check that using the lagged notional value series leads to the same results
     # as the original calculation. This proves that we can re-derive the price
     # series from the other data available on the strategy
     notl_values = t.strategy.notional_values.shift(1)
-    notl_values[dts[0]] = 1e6 # The notional value *before* any trades are put on
-    norm_res = bt.backtest.RenormalizedFixedIncomeResult( 
-                                notl_values, 
-                                *res.backtest_list )
+    notl_values[dts[0]] = 1e6  # The notional value *before* any trades are put on
+    norm_res = bt.backtest.RenormalizedFixedIncomeResult(
+        notl_values, *res.backtest_list
+    )
 
-    assert norm_res.stats['s'].total_return == res.stats['s'].total_return   
-    assert norm_res.prices.equals( res.prices )    
-    
-    
+    assert norm_res.stats["s"].total_return == res.stats["s"].total_return
+    assert norm_res.prices.equals(res.prices)
+
+    # A missing interior denominator must not let ffn silently shorten the history.
+    with pytest.raises(ValueError, match="finite, non-zero"):
+        bt.backtest.RenormalizedFixedIncomeResult(
+            notl_values.drop(dts[2]), *res.backtest_list
+        )
+
+
+def _fixed_income_result_backtest(name="s", stat_index=None):
+    """Build a result-only backtest with independently specified additive P&L."""
+    dates = pd.date_range("2026-01-01", periods=5)
+    strategy = mock.Mock()
+    strategy.name = name
+    strategy.fixed_income = True
+    strategy.values = pd.Series([0.0, 0.0, 100.0, 300.0, 600.0], index=dates)
+    strategy.flows = pd.Series(0.0, index=dates)
+
+    backtest = mock.Mock()
+    backtest.name = name
+    backtest.strategy = strategy
+    backtest._stat_prices = (
+        None if stat_index is None else pd.Series(100.0, index=stat_index)
+    )
+    return backtest
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param(0.0, id="zero"),
+        pytest.param(np.nan, id="nan"),
+        pytest.param(np.inf, id="positive-infinity"),
+        pytest.param(-np.inf, id="negative-infinity"),
+    ],
+)
+def test_renormalized_fixed_income_result_rejects_invalid_denominators(
+    invalid_value,
+):
+    backtest = _fixed_income_result_backtest()
+    dates = backtest.strategy.values.index
+    normalizer = pd.Series(100.0, index=dates)
+    if invalid_value is None:
+        normalizer = normalizer.drop(dates[2])
+    else:
+        normalizer.loc[dates[2]] = invalid_value
+
+    # Every post-bootstrap increment needs a usable same-date denominator.
+    with pytest.raises(ValueError, match="finite, non-zero"):
+        bt.backtest.RenormalizedFixedIncomeResult(normalizer, backtest)
+
+
+def test_renormalized_fixed_income_result_ignores_unneeded_normalizer_labels():
+    backtest = _fixed_income_result_backtest()
+    dates = backtest.strategy.values.index
+    extra_date = dates[0] - pd.Timedelta(days=1)
+    normalizer = pd.Series(100.0, index=dates[1:].insert(0, extra_date))
+
+    result = bt.backtest.RenormalizedFixedIncomeResult(normalizer, backtest)
+
+    # The bootstrap denominator is unused, while extra labels must not enter prices.
+    expected = pd.Series([100.0, 100.0, 200.0, 400.0, 700.0], index=dates)
+    pd.testing.assert_series_equal(result.prices["s"], expected, check_names=False)
+    assert result.stats.loc["total_return", "s"] == pytest.approx(6.0)
+
+
+def test_renormalized_fixed_income_result_validates_each_mapped_backtest():
+    first = _fixed_income_result_backtest("first")
+    dates = first.strategy.values.index
+    second = _fixed_income_result_backtest("second", stat_index=dates[3:])
+    normalizers = {
+        "first": 100.0,
+        "second": pd.Series(100.0, index=dates.delete(2)),
+    }
+
+    # Validation precedes both result construction and the later statistics window.
+    with pytest.raises(ValueError, match="second.*finite, non-zero"):
+        bt.backtest.RenormalizedFixedIncomeResult(normalizers, first, second)
+
+
+@pytest.mark.parametrize("as_series", [False, True], ids=["dataframe", "series"])
+def test_additional_data_auxiliary_bootstrap_boolean_dtype_no_warning(as_series):
+    """Test that the bootstrap row stays missing without a bool concat warning."""
+    import warnings
+
+    dts = pd.date_range("2010-01-01", periods=5)
+    data = pd.DataFrame(index=dts, columns=["a", "b"], data=100.0)
+
+    # Exercise NumPy bool while retaining the warning regression covered by this test.
+    signal = pd.Series([True, False, True, False, True], index=dts, name="signal")
+    if not as_series:
+        signal = signal.to_frame()
+
+    s = bt.Strategy(
+        "test", [bt.algos.SelectAll(), bt.algos.WeighEqually(), bt.algos.Rebalance()]
+    )
+
+    # Require both the missing-row contract and warning-free pandas concatenation.
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        t = bt.Backtest(s, data, additional_data={"signal": signal}, progress_bar=False)
+        t.run()
+
+        processed = t.additional_data["signal"]
+        assert np.asarray(pd.isna(processed.iloc[0])).all()
+        if as_series:
+            pd.testing.assert_series_equal(processed.iloc[1:], signal, check_dtype=False, check_freq=False)
+        else:
+            pd.testing.assert_frame_equal(processed.iloc[1:], signal, check_dtype=False, check_freq=False)
+
+        future_warnings = [warning for warning in w
+                          if issubclass(warning.category, FutureWarning)
+                          and "bool-dtype" in str(warning.message).lower()]
+        assert len(future_warnings) == 0
+
+
+@pytest.mark.parametrize("as_series", [False, True], ids=["dataframe", "series"])
+@pytest.mark.parametrize(
+    ("dtype", "values", "expected_dtype"),
+    [
+        ("int64", [1, 0, 1, 0, 1], "float64"),
+        ("int64", [2**53, 2**53 + 1, 2**53 + 2, 2**53 + 3, 2**53 + 4], "Int64"),
+        ("int64", [-2**63, -2**63 + 1, -2**53 - 1, 2**63 - 2, 2**63 - 1], "Int64"),
+        ("uint64", [0, 2**53, 2**53 + 1, 2**64 - 2, 2**64 - 1], "UInt64"),
+        ("int64", [2**54, 2**54 + 4, 2**54 + 8, -2**54, -2**54 - 4], "float64"),
+        ("Int64", [1, 0, 1, 0, 1], "Int64"),
+        ("Int64", [2**53, pd.NA, 2**53 + 1, 0, 1], "Int64"),
+        ("UInt64", [2**64 - 1, pd.NA, 2**64 - 2, 0, 1], "UInt64"),
+        ("boolean", [True, False, True, False, True], "boolean"),
+        ("float64", [1, 0, 1, 0, 1], "float64"),
+    ],
+)
+def test_additional_data_auxiliary_bootstrap_dtypes(as_series, dtype, values, expected_dtype):
+    """Preserve dated auxiliary values while making the bootstrap row missing."""
+    dates = pd.date_range("2010-01-01", periods=5)
+    data = pd.DataFrame(100.0, index=dates, columns=["a"])
+    auxiliary = pd.Series(values, index=dates, dtype=dtype, name="value")
+    if not as_series:
+        auxiliary = auxiliary.to_frame()
+    original = auxiliary.copy(deep=True)
+    strategy = bt.Strategy("test", [])
+
+    backtest = bt.Backtest(
+        strategy,
+        data,
+        additional_data={"auxiliary": auxiliary},
+        progress_bar=False,
+    )
+    processed = backtest.additional_data["auxiliary"]
+
+    # The synthetic row may widen dtype, but it must not alter dated observations.
+    assert processed.index[0] == dates[0] - pd.DateOffset(days=1)
+    column = processed if as_series else processed["value"]
+    assert pd.isna(column.iloc[0])
+    assert str(column.dtype) == expected_dtype
+    # Compare Python integers: pandas float/int equality can round the oracle too.
+    if pd.api.types.is_integer_dtype(dtype):
+        assert [None if pd.isna(v) else int(v) for v in column.iloc[1:]] == [None if pd.isna(v) else int(v) for v in values]
+    assert_equal = pd.testing.assert_series_equal if as_series else pd.testing.assert_frame_equal
+    assert_equal(processed.iloc[1:], auxiliary, check_dtype=False, check_freq=False)
+    assert_equal(auxiliary, original)
+
+
+def test_additional_data_integer_precision_with_duplicate_columns():
+    dates = pd.date_range("2020-01-01", periods=3, tz="America/New_York")
+    auxiliary = pd.DataFrame({"id": [2**53, 2**53 + 1, 2**53 + 2], "small": [0, 1, 2]})
+    auxiliary.index = dates
+    auxiliary.columns = pd.Index(["value", "value"], name="observations")
+    original = auxiliary.copy(deep=True)
+    backtest = bt.Backtest(bt.Strategy("test"), pd.DataFrame(100.0, index=dates, columns=["a"]), additional_data={"ids": auxiliary})
+    processed = backtest.additional_data["ids"]
+
+    # Duplicate names must not convert the safe column along with the lossy one.
+    pd.testing.assert_index_equal(processed.columns, auxiliary.columns)
+    assert processed.iloc[0].isna().all()
+    assert [int(v) for v in processed.iloc[1:, 0]] == [2**53, 2**53 + 1, 2**53 + 2]
+    assert str(processed.dtypes.iloc[0]) == "Int64"
+    assert str(processed.dtypes.iloc[1]) == "float64"
+    pd.testing.assert_frame_equal(processed.iloc[1:], auxiliary, check_dtype=False, check_freq=False)
+    pd.testing.assert_frame_equal(auxiliary, original)
+
+
+@pytest.mark.parametrize("as_series", [False, True], ids=["dataframe", "series"])
+def test_additional_data_integer_ids_preserve_allocations(as_series):
+    dates = pd.date_range("2026-10-07", periods=5)
+    base = pd.Timestamp("2026-10-07").value
+    ids = pd.Series([base, base + 1, base, base + 1, base], index=dates, dtype="int64", name="id")
+    auxiliary = ids if as_series else ids.to_frame()
+
+    def lookup_weight(target):
+        observations = target.get_data("ids")
+        event_id = observations.at[target.now] if as_series else observations.at[target.now, "id"]
+        target.temp["weights"] = {"a": {base: 0.0, base + 1: 1.0}[int(event_id)]}
+        return True
+
+    strategy = bt.Strategy("test", [lookup_weight, bt.algos.Rebalance()], children=[bt.Security("a")])
+    backtest = bt.Backtest(strategy, pd.DataFrame(100.0, index=dates, columns=["a"]), initial_capital=100_000.0, additional_data={"ids": auxiliary})
+    backtest.run()
+
+    # With zero fees and constant price 100, each invested bar holds 100000 / 100.
+    assert backtest.strategy.positions["a"].iloc[1:].tolist() == [0.0, 1000.0, 0.0, 1000.0, 0.0]
+    np.testing.assert_allclose(backtest.strategy.values, 100_000.0)
+    pd.testing.assert_series_equal(ids, pd.Series([base, base + 1, base, base + 1, base], index=dates, dtype="int64", name="id"))
+
+
+def _impact_universe(n_periods=60, n_securities=3, seed=0):
+    np.random.seed(seed)
+    dates = pd.date_range("2020-01-01", periods=n_periods, freq="B")
+    cols = [chr(ord("A") + i) for i in range(n_securities)]
+    prices = pd.DataFrame(
+        100 + np.random.randn(n_periods, n_securities).cumsum(axis=0),
+        index=dates,
+        columns=cols,
+    )
+    volume = pd.DataFrame(1_000_000.0, index=dates, columns=cols)
+    volatility = pd.DataFrame(0.02, index=dates, columns=cols)
+    return prices, volume, volatility
+
+
+def _ew_strategy(name="ew"):
+    return bt.Strategy(
+        name,
+        [
+            bt.algos.RunQuarterly(),
+            bt.algos.SelectAll(),
+            bt.algos.WeighEqually(),
+            bt.algos.Rebalance(),
+        ],
+    )
+
+
+@pytest.mark.parametrize("cost_model_type", [bt.SqrtCostModel, bt.AlmgrenChrissCostModel])
+def test_backtest_integer_volume_matches_float_volume(cost_model_type):
+    """Treat integer and equivalent float volume identically in cost models."""
+    prices, float_volume, volatility = _impact_universe()
+    integer_volume = float_volume.astype("int64")
+
+    # Use float volume as the numerical reference for each nonlinear cost model.
+    float_backtest = bt.Backtest(
+        _ew_strategy(),
+        prices,
+        name="float_volume",
+        commissions=cost_model_type(),
+        volume=float_volume,
+        volatility=volatility,
+        initial_capital=10_000_000.0,
+        progress_bar=False,
+    )
+    integer_backtest = bt.Backtest(
+        _ew_strategy(),
+        prices,
+        name="integer_volume",
+        commissions=cost_model_type(),
+        volume=integer_volume,
+        volatility=volatility,
+        initial_capital=10_000_000.0,
+        progress_bar=False,
+    )
+
+    float_backtest.run()
+    integer_backtest.run()
+
+    # Alignment changes representation only; observed volume must remain unchanged.
+    aligned_integer_volume = integer_backtest.volume
+    assert aligned_integer_volume is not None
+    assert aligned_integer_volume.iloc[0].isna().all()
+    pd.testing.assert_frame_equal(
+        aligned_integer_volume.iloc[1:],
+        integer_volume,
+        check_dtype=False,
+        check_freq=False,
+    )
+
+    # Derive trades independently from position changes rather than result helpers.
+    integer_positions = pd.DataFrame({security.name: security.positions for security in integer_backtest.strategy.securities})
+    float_positions = pd.DataFrame({security.name: security.positions for security in float_backtest.strategy.securities})
+    integer_trades = integer_positions.diff()
+    integer_trades.iloc[0] = integer_positions.iloc[0]
+    float_trades = float_positions.diff()
+    float_trades.iloc[0] = float_positions.iloc[0]
+    pd.testing.assert_frame_equal(integer_trades, float_trades)
+
+    # Cost-model accounting must match for numerically equivalent volume inputs.
+    np.testing.assert_allclose(integer_backtest.strategy.prices, float_backtest.strategy.prices)
+    np.testing.assert_allclose(integer_backtest.strategy.fees, float_backtest.strategy.fees)
+
+
+@pytest.mark.parametrize("source_run", [False, True], ids=["unrun", "completed"])
+@pytest.mark.parametrize("cost_model", [False, True], ids=["callable", "cost-model"])
+@pytest.mark.parametrize("tree", ["flat", "nested", "nested-lazy"])
+def test_backtest_copies_cost_model_strategy_without_changing_source(source_run, cost_model, tree):
+    dates = pd.date_range("2020-01-01", periods=3)
+    prices = pd.DataFrame({"A": 100.0}, index=dates)
+
+    def trade(target):
+        # Use the current owner's dates so this logic is reusable on a new universe.
+        if target.now == target._original_data.index[1]:
+            target.transact(2.0, "A")
+        elif target.now == target._original_data.index[-1]:
+            target.close("A")
+        return True
+
+    def fund(target):
+        if target.now == target._original_data.index[1]:
+            target.allocate(1_000.0, "leaf")
+        return True
+
+    security = "A" if tree == "nested-lazy" else bt.Security("A")
+    leaf = bt.Strategy("leaf", [trade], children=[security])
+    strategy = leaf if tree == "flat" else bt.Strategy("root", [fund], children=[leaf])
+    source = bt.Backtest(
+        strategy, prices, initial_capital=10_000.0,
+        commissions=bt.AlmgrenChrissCostModel(alpha=0, beta=0, epsilon=0.01),
+        volume=prices * 10_000, volatility=prices * 0.0002,
+    )
+    source.strategy.perm["observer"] = {"labels": ["source"]}
+    if source_run:
+        source.run()
+    source_setup = source.strategy.setup
+    source_nodes = source.strategy.members[:]
+    if source_run and tree != "flat":
+        source_nodes += source.strategy["leaf"]._paper.members
+    snapshots = [node.data.copy(deep=True) for node in source_nodes] if source_run else []
+
+    new_prices = prices.set_axis(dates + pd.DateOffset(years=1))
+    kwargs = {"commissions": lambda quantity, price: abs(quantity) * price * 0.02}
+    if cost_model:
+        kwargs = {
+            "commissions": bt.AlmgrenChrissCostModel(alpha=0, beta=0, epsilon=0.02),
+            "volume": new_prices * 20_000, "volatility": new_prices * 0.0003,
+        }
+    copied = bt.Backtest(source.strategy, new_prices, initial_capital=10_000.0, **kwargs)
+    copied.run()
+
+    copied_leaf = copied.strategy if tree == "flat" else copied.strategy["leaf"]
+    # Two shares at 100 cost 4 per trade at the destination's 2% rate, not 2
+    # at the source's 1% rate. Buy and liquidation independently total 8.
+    assert copied_leaf.fees.sum() == pytest.approx(8.0)
+    assert copied_leaf["A"].commission(2.0, 100.0) == pytest.approx(4.0)
+    if tree != "flat":
+        assert copied_leaf._paper.fees.sum() == pytest.approx(8.0)
+    assert copied.strategy.data.index.equals(copied.dates)
+    assert copied_leaf["A"].position == 0
+
+    # Active mutations expose shared ownership that passive equality can hide.
+    copied.strategy.perm["observer"]["labels"][0] = "copy"
+    copied.strategy.data.iloc[0, 0] = -1.0
+    copied.strategy.data.index = copied.strategy.data.index + pd.DateOffset(days=1)
+    assert source.strategy.perm["observer"] == {"labels": ["source"]}
+    assert source.strategy.setup is source_setup
+    if source_run:
+        for node, before in zip(source_nodes, snapshots):
+            pd.testing.assert_frame_equal(node.data, before)
+    else:
+        assert not hasattr(source.strategy, "_setup_kwargs")
+
+
+def test_backtest_copied_cost_model_preserves_caller_hooks():
+    class CustomStrategy(bt.Strategy):
+        def setup(self, universe, **kwargs):
+            self.setup_calls = getattr(self, "setup_calls", 0) + 1
+            return super().setup(universe, **kwargs)
+
+    dates = pd.date_range("2020-01-01", periods=3)
+    prices = pd.DataFrame({"A": 100.0}, index=dates)
+    security = bt.Security("A")
+    security.commission = lambda quantity, price: 13.0
+    strategy = CustomStrategy("s", children=[security])
+    strategy.set_commissions(lambda quantity, price: 17.0)
+    source = bt.Backtest(
+        strategy, prices,
+        commissions=bt.AlmgrenChrissCostModel(alpha=0, beta=0, epsilon=0.01),
+        volume=prices * 10_000, volatility=prices * 0.0002,
+    )
+    source.strategy.setup(source.data)
+    source.strategy.update(dates[0])
+    before = source.strategy.data.copy(deep=True)
+    copied = bt.Backtest(source.strategy, prices)
+    copied.strategy.setup(copied.data)
+
+    # Omitting commissions preserves the template's original caller callables;
+    # only the source Backtest's market-data-dependent binding is discarded.
+    assert copied.strategy.setup_calls == 2
+    assert source.strategy.setup_calls == 1
+    assert copied.strategy.commission_fn(1.0, 100.0) == 17.0
+    assert copied.strategy["A"].commission(1.0, 100.0) == 13.0
+    assert source.strategy["A"].commission(1.0, 100.0) == 1.0
+    pd.testing.assert_frame_equal(source.strategy.data, before)
+
+    # Existing repeated wiring must not overwrite a later caller fee override.
+    source.strategy["A"].commission = lambda quantity, price: 19.0
+    source._wire_strategy_tree(source.strategy)
+    source._wire_security(source.strategy["A"])
+    assert source.strategy["A"].commission(1.0, 100.0) == 19.0
+
+
+def test_backtest_copies_dynamic_cost_model_setup_hook():
+    dates = pd.date_range("2020-01-01", periods=3)
+    prices = pd.DataFrame({"A": 100.0}, index=dates)
+    source = bt.Backtest(
+        bt.Strategy("root"), prices,
+        commissions=bt.AlmgrenChrissCostModel(alpha=0, beta=0, epsilon=0.01),
+        volume=prices * 10_000, volatility=prices * 0.0002,
+    )
+    source.strategy.setup(source.data)
+    leaf = bt.Strategy("leaf", children=["A"], parent=source.strategy)
+    leaf.setup_from_parent()
+    original_setup = leaf.setup_from_parent
+    before = leaf.data.copy(deep=True)
+    paper_before = leaf._paper.data.copy(deep=True)
+
+    new_prices = prices.set_axis(dates + pd.DateOffset(years=1))
+    copied = bt.Backtest(
+        source.strategy, new_prices,
+        commissions=bt.AlmgrenChrissCostModel(alpha=0, beta=0, epsilon=0.02),
+        volume=new_prices * 20_000, volatility=new_prices * 0.0003,
+    )
+    copied.strategy.setup(copied.data)
+    copied_leaf = copied.strategy["leaf"]
+    copied_setup = copied_leaf.setup_from_parent
+    copied._wire_nested_strategy(copied_leaf)
+    assert copied_leaf.setup_from_parent is copied_setup
+    # Calling the copied dynamic setup entry must operate on its new parent,
+    # never replace the source leaf's real or paper history.
+    copied_leaf.setup_from_parent()
+    assert copied_leaf.data.index.equals(copied.dates)
+    assert copied_leaf._paper.data.index.equals(copied.dates)
+    copied.strategy.adjust(1_000.0)
+    copied.strategy.update(new_prices.index[0])
+    copied.strategy.allocate(1_000.0, "leaf")
+    copied_leaf.transact(2.0, "A")
+    copied_leaf._paper.transact(2.0, "A")
+    # Recreating a paper tree must retain the destination's 2% cost binding,
+    # not silently fall back to the default zero commission.
+    assert copied_leaf["A"].commission(2.0, 100.0) == pytest.approx(4.0)
+    assert copied_leaf._paper["A"].commission(2.0, 100.0) == pytest.approx(4.0)
+    copied.strategy.update(new_prices.index[0])
+    assert copied_leaf.fees.sum() == pytest.approx(4.0)
+    assert copied_leaf._paper.fees.sum() == pytest.approx(4.0)
+    assert leaf.setup_from_parent is original_setup
+    pd.testing.assert_frame_equal(leaf.data, before)
+    pd.testing.assert_frame_equal(leaf._paper.data, paper_before)
+
+
+@pytest.mark.parametrize("entry", ["setup", "setup_from_parent"])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("lazy", [False, True])
+def test_backtest_repeated_setup_preserves_paper_cost_model(entry, nested, lazy):
+    dates = pd.date_range("2020-01-01", periods=3)
+    prices = pd.DataFrame({"A": 100.0}, index=dates)
+    leaf = bt.Strategy("leaf", children=["A" if lazy else bt.Security("A")])
+    child = bt.Strategy("branch", children=[leaf]) if nested else leaf
+    backtest = bt.Backtest(
+        bt.Strategy("root", children=[child]), prices,
+        commissions=bt.AlmgrenChrissCostModel(alpha=0, beta=0, epsilon=0.02),
+        volume=prices * 10_000, volatility=prices * 0.0002,
+    )
+    backtest.strategy.setup(backtest.data)
+    backtest.strategy.adjust(1_000.0)
+    backtest.strategy.update(dates[0])
+
+    for repeated in [False, True]:
+        if repeated:
+            if entry == "setup":
+                backtest.strategy.setup(backtest.data)
+            else:
+                backtest.strategy[child.name].setup_from_parent()
+            backtest.strategy.update(dates[0])
+
+        pending = [backtest.strategy]
+        paper_leaves = []
+        while pending:
+            strategy = pending.pop()
+            if strategy.name == "leaf":
+                strategy._create_child_if_needed("A")
+                assert strategy["A"].commission(2.0, 100.0) == pytest.approx(4.0)
+                if strategy.parent is strategy:
+                    paper_leaves.append(strategy)
+            pending.extend(node for node in strategy._childrenv if isinstance(node, bt.core.StrategyBase))
+            if strategy._paper_trade:
+                pending.append(strategy._paper)
+
+        assert len(paper_leaves) == (2 if nested else 1)
+        if repeated:
+            for paper in paper_leaves:
+                before = paper.capital
+                paper.transact(2.0, "A")
+                paper.update(dates[0])
+                assert paper.capital == pytest.approx(before - 204.0)
+                assert paper.fees.sum() == pytest.approx(4.0)
+
+
+def test_backtest_cost_model_runs_and_charges_fees():
+    prices, volume, volatility = _impact_universe()
+    bkt = bt.Backtest(
+        _ew_strategy(),
+        prices,
+        commissions=bt.AlmgrenChrissCostModel(),
+        volume=volume,
+        volatility=volatility,
+        initial_capital=10_000_000.0,
+        progress_bar=False,
+    )
+
+    bt.run(bkt)
+
+    assert bkt.has_run
+    assert bkt.strategy.fees.sum() > 0.0
+    assert len(bkt.strategy.prices) == len(bkt.dates)
+
+
+def test_backtest_cost_model_ac_zero_alpha_beta_matches_flat_commission():
+    prices, volume, volatility = _impact_universe()
+    eps = 0.0005
+
+    cost_model = bt.Backtest(
+        _ew_strategy("cost_model"),
+        prices,
+        commissions=bt.AlmgrenChrissCostModel(alpha=0, beta=0, epsilon=eps),
+        volume=volume,
+        volatility=volatility,
+        initial_capital=10_000_000.0,
+        progress_bar=False,
+    )
+    legacy = bt.Backtest(
+        _ew_strategy("legacy"),
+        prices,
+        commissions=lambda q, p: abs(q) * p * eps,
+        initial_capital=10_000_000.0,
+        progress_bar=False,
+    )
+
+    bt.run(cost_model, legacy)
+
+    np.testing.assert_allclose(
+        cost_model.strategy.prices.values, legacy.strategy.prices.values
+    )
+    np.testing.assert_allclose(
+        cost_model.strategy.fees.sum(), legacy.strategy.fees.sum()
+    )
+
+
+@pytest.mark.parametrize("lazy_security", [False, True], ids=["explicit", "lazy"])
+def test_backtest_cost_model_matches_legacy_in_nested_strategies(
+    lazy_security: bool,
+):
+    dates = pd.date_range("2020-01-01", periods=3, freq="B")
+    prices = pd.DataFrame({"A": 100.0}, index=dates)
+    volume = pd.DataFrame({"A": 1_000_000.0}, index=dates)
+    volatility = pd.DataFrame({"A": 0.02}, index=dates)
+    epsilon = 0.01
+
+    def trade_algos() -> list[bt.Algo]:
+        return [
+            bt.algos.RunOnDate(dates[0]),
+            bt.algos.SelectAll(),
+            bt.algos.WeighEqually(),
+            bt.algos.Rebalance(),
+        ]
+
+    def nested_strategy(name: str) -> bt.Strategy:
+        security = "A" if lazy_security else bt.Security("A")
+        leaf = bt.Strategy("leaf", trade_algos(), children=[security])
+        return bt.Strategy(name, trade_algos(), children=[leaf])
+
+    def legacy_commission(q: float, p: float) -> float:
+        return abs(q) * p * epsilon
+
+    cost_model = bt.Backtest(
+        nested_strategy("cost_model"),
+        prices,
+        commissions=bt.AlmgrenChrissCostModel(alpha=0, beta=0, epsilon=epsilon),
+        volume=volume,
+        volatility=volatility,
+        initial_capital=10_000.0,
+        integer_positions=False,
+        progress_bar=False,
+    )
+    legacy = bt.Backtest(
+        nested_strategy("legacy"),
+        prices,
+        commissions=legacy_commission,
+        initial_capital=10_000.0,
+        integer_positions=False,
+        progress_bar=False,
+    )
+
+    bt.run(cost_model, legacy)
+
+    cost_leaf = cost_model.strategy["leaf"]
+    legacy_leaf = legacy.strategy["leaf"]
+
+    # Derive the real trade and fee directly from the cost-inclusive unit outlay.
+    expected_quantity = 10_000.0 / (100.0 * (1.0 + epsilon))
+    expected_fee = expected_quantity * 100.0 * epsilon
+    assert cost_leaf["A"].position == pytest.approx(expected_quantity)
+    assert cost_leaf.fees.sum() == pytest.approx(expected_fee)
+    assert cost_model.strategy.value == pytest.approx(10_000.0 - expected_fee)
+    assert cost_model.strategy.value == pytest.approx(legacy.strategy.value)
+
+    # Paper strategies trade a fixed independent amount but obey the same cost contract.
+    expected_paper_quantity = 1_000_000.0 / (100.0 * (1.0 + epsilon))
+    expected_paper_fee = expected_paper_quantity * 100.0 * epsilon
+    assert cost_leaf._paper["A"].position == pytest.approx(expected_paper_quantity)
+    assert cost_leaf._paper.fees.sum() == pytest.approx(expected_paper_fee)
+    assert cost_leaf.price == pytest.approx(legacy_leaf.price)
+
+
+def test_backtest_cost_model_applies_to_dynamic_nested_strategy():
+    dates = pd.date_range("2020-01-01", periods=2, freq="B")
+    prices = pd.DataFrame({"A": 100.0}, index=dates)
+    volume = pd.DataFrame({"A": 1_000_000.0}, index=dates)
+    volatility = pd.DataFrame({"A": 0.02}, index=dates)
+
+    def add_leaf(target):
+        leaf = bt.Strategy(
+            "leaf",
+            [bt.algos.RunOnce(), bt.algos.SelectAll(), bt.algos.WeighEqually(), bt.algos.Rebalance()],
+            children=["A"],
+            parent=target,
+        )
+        leaf.setup_from_parent()
+        leaf.update(target.now)
+        target.allocate(target.value, leaf.name)
+        return True
+
+    strategy = bt.Strategy("root", [bt.algos.RunOnce(), add_leaf])
+    backtest = bt.Backtest(
+        strategy,
+        prices,
+        commissions=bt.AlmgrenChrissCostModel(alpha=0, beta=0, epsilon=0.01),
+        volume=volume,
+        volatility=volatility,
+        initial_capital=10_000.0,
+        integer_positions=False,
+        progress_bar=False,
+    )
+
+    backtest.run()
+
+    leaf = backtest.strategy["leaf"]
+    expected_quantity = 10_000.0 / 101.0
+    assert leaf["A"].position == pytest.approx(expected_quantity)
+    assert leaf.fees.sum() == pytest.approx(expected_quantity)
+    assert leaf._paper["A"].position == pytest.approx(1_000_000.0 / 101.0)
+
+
+def test_backtest_dynamic_strategy_inherits_legacy_commissions():
+    dates = pd.date_range("2020-01-01", periods=2, freq="B")
+    prices = pd.DataFrame({"A": 100.0}, index=dates)
+
+    def add_leaf(target):
+        leaf = bt.Strategy(
+            "leaf",
+            [
+                bt.algos.RunOnce(),
+                bt.algos.SelectAll(),
+                bt.algos.WeighEqually(),
+                bt.algos.Rebalance(),
+            ],
+            children=["A"],
+            parent=target,
+        )
+        leaf.setup_from_parent()
+        leaf.update(target.now)
+        target.allocate(target.value, leaf.name)
+        return True
+
+    backtest = bt.Backtest(
+        bt.Strategy("root", [bt.algos.RunOnce(), add_leaf]),
+        prices,
+        commissions=lambda quantity, price: 7.0,
+        initial_capital=1_000.0,
+        progress_bar=False,
+    )
+
+    backtest.run()
+
+    leaf = backtest.strategy["leaf"]
+    # A $7 fee makes 9 shares the largest affordable integer position.
+    assert leaf["A"].position == 9
+    assert leaf.fees.sum() == pytest.approx(7.0)
+    assert backtest.strategy.value == pytest.approx(993.0)
+
+    # The independent paper trade follows the same inherited cost contract.
+    assert leaf._paper["A"].position == 9_999
+    assert leaf._paper.fees.sum() == pytest.approx(7.0)
+
+
+def test_backtest_cost_model_active_ac_costs_higher_than_flat_path():
+    prices, volume, volatility = _impact_universe()
+    eps = 0.0005
+
+    flat = bt.Backtest(
+        _ew_strategy("flat"),
+        prices,
+        commissions=bt.AlmgrenChrissCostModel(alpha=0, beta=0, epsilon=eps),
+        volume=volume,
+        volatility=volatility,
+        initial_capital=10_000_000.0,
+        progress_bar=False,
+    )
+    active = bt.Backtest(
+        _ew_strategy("active"),
+        prices,
+        commissions=bt.AlmgrenChrissCostModel(alpha=1, beta=1, epsilon=eps),
+        volume=volume,
+        volatility=volatility,
+        initial_capital=10_000_000.0,
+        progress_bar=False,
+    )
+
+    bt.run(flat, active)
+
+    assert active.strategy.fees.sum() > flat.strategy.fees.sum()
+
+
+def test_backtest_sqrt_cost_model_runs():
+    prices, volume, volatility = _impact_universe()
+    bkt = bt.Backtest(
+        _ew_strategy(),
+        prices,
+        commissions=bt.SqrtCostModel(Y=0.6),
+        volume=volume,
+        volatility=volatility,
+        initial_capital=10_000_000.0,
+        progress_bar=False,
+    )
+
+    bt.run(bkt)
+    assert bkt.strategy.fees.sum() > 0.0
+
+
+def test_backtest_cost_model_validates_index_alignment():
+    prices, volume, volatility = _impact_universe()
+    misaligned = volume.iloc[1:].copy()
+    with pytest.raises(ValueError, match="index"):
+        bt.Backtest(
+            _ew_strategy(),
+            prices,
+            commissions=bt.AlmgrenChrissCostModel(),
+            volume=misaligned,
+            volatility=volatility,
+            progress_bar=False,
+        )
+
+
+def test_backtest_cost_model_validates_columns_alignment():
+    prices, volume, volatility = _impact_universe()
+    misaligned = volume.rename(columns={volume.columns[0]: "Z"})
+    with pytest.raises(ValueError, match="columns"):
+        bt.Backtest(
+            _ew_strategy(),
+            prices,
+            commissions=bt.AlmgrenChrissCostModel(),
+            volume=misaligned,
+            volatility=volatility,
+            progress_bar=False,
+        )
+
+
+def test_backtest_cost_model_requires_volume_and_volatility():
+    prices, volume, volatility = _impact_universe()
+    with pytest.raises(ValueError, match="required"):
+        bt.Backtest(
+            _ew_strategy(),
+            prices,
+            commissions=bt.AlmgrenChrissCostModel(),
+            progress_bar=False,
+        )
+
+
+@pytest.mark.parametrize("market_input", ["volume", "volatility"])
+@pytest.mark.parametrize("dtype", ["float64", "Float64"])
+@pytest.mark.parametrize(
+    ("invalid_value", "case"),
+    [
+        pytest.param(-1.0, "negative", id="negative"),
+        pytest.param(np.nan, "missing", id="missing"),
+        pytest.param(np.inf, "infinite", id="infinite"),
+    ],
+)
+def test_backtest_cost_model_rejects_invalid_market_data(
+    market_input,
+    dtype,
+    invalid_value,
+    case,
+):
+    prices, volume, volatility = _impact_universe(n_periods=2, n_securities=1)
+    frames = {"volume": volume, "volatility": volatility}
+    frame = frames[market_input].astype(dtype)
+    frame.iloc[0, 0] = pd.NA if dtype == "Float64" and case == "missing" else invalid_value
+    frames[market_input] = frame
+    strategy = bt.Strategy(
+        "strategy",
+        [
+            bt.algos.RunOnce(),
+            bt.algos.SelectAll(),
+            bt.algos.WeighEqually(),
+            bt.algos.Rebalance(),
+        ],
+        children=[bt.Security("A")],
+    )
+
+    # Complete market inputs must be rejected before the strategy template is used.
+    with pytest.raises(ValueError, match=market_input), np.errstate(all="raise"):
+        bt.Backtest(
+            strategy,
+            prices,
+            commissions=bt.SqrtCostModel(),
+            volume=frames["volume"],
+            volatility=frames["volatility"],
+            initial_capital=1_000.0,
+            integer_positions=False,
+            progress_bar=False,
+        )
+
+    assert strategy["A"].position == 0.0
+    assert strategy.capital == 0.0
+
+
+@pytest.mark.parametrize("market_input", ["volume", "volatility"])
+def test_backtest_cost_model_accepts_zero_market_data(market_input):
+    prices, volume, volatility = _impact_universe(n_periods=2, n_securities=1)
+    frames = {"volume": volume, "volatility": volatility}
+    frames[market_input].iloc[:, :] = 0.0
+    backtest = bt.Backtest(
+        _ew_strategy(),
+        prices,
+        commissions=bt.SqrtCostModel(),
+        volume=frames["volume"],
+        volatility=frames["volatility"],
+        initial_capital=1_000.0,
+        integer_positions=False,
+        progress_bar=False,
+    )
+
+    backtest.run()
+
+    # Neutral market inputs remain valid and produce no impact cost.
+    assert backtest.strategy.fees.sum() == 0.0
+
+
+def test_backtest_cost_model_rejects_runtime_invalid_input_before_trade():
+    dates = pd.date_range("2026-01-01", periods=2)
+    prices = pd.DataFrame({"asset": 100.0}, index=dates)
+    volume = pd.DataFrame({"asset": 1_000.0}, index=dates)
+    volatility = pd.DataFrame({"asset": 0.2}, index=dates)
+    strategy = bt.Strategy(
+        "strategy",
+        [
+            bt.algos.RunOnce(),
+            bt.algos.SelectAll(),
+            bt.algos.WeighEqually(),
+            bt.algos.Rebalance(),
+        ],
+    )
+    backtest = bt.Backtest(
+        strategy,
+        prices,
+        commissions=bt.SqrtCostModel(),
+        volume=volume,
+        volatility=volatility,
+        initial_capital=1_000.0,
+        integer_positions=False,
+        progress_bar=False,
+    )
+    backtest.volatility.loc[dates[0], "asset"] = -0.2
+
+    # The per-trade guard protects callers that alter public inputs after construction.
+    with pytest.raises(ValueError, match="volatility"), np.errstate(all="raise"):
+        backtest.run()
+
+    security = backtest.strategy["asset"]
+    assert security.position == 0.0
+    assert security._outlay == 0.0
+    assert backtest.strategy.capital == 1_000.0
+    assert backtest.strategy.fees.sum() == 0.0
+    assert backtest.strategy.get_transactions().empty
+
+
+@pytest.mark.parametrize("cost_model_type", [bt.SqrtCostModel, bt.AlmgrenChrissCostModel])
+@pytest.mark.parametrize("market_input", ["volume", "volatility"])
+@pytest.mark.parametrize(
+    ("initial_position", "method", "amount"),
+    [(0.0, "transact", 1.0), (2.0, "transact", 1.0), (2.0, "transact", -2.0), (2.0, "allocate", -200.0)],
+    ids=["open", "add", "close", "allocate-close"],
+)
+def test_cost_model_rejection_preserves_transaction_state(cost_model_type, market_input, initial_position, method, amount):
+    dates = pd.date_range("2026-01-01", periods=2)
+    prices = pd.DataFrame({"asset": 100.0}, index=dates)
+    backtest = bt.Backtest(
+        bt.Strategy("strategy", children=[bt.Security("asset")]),
+        prices,
+        commissions=cost_model_type(),
+        volume=prices * 10.0,
+        volatility=prices * 0.002,
+        initial_capital=1_000.0,
+        integer_positions=False,
+        progress_bar=False,
+    )
+    backtest.run()
+    strategy = backtest.strategy
+    security = strategy["asset"]
+    security.transact(initial_position)
+    strategy.update(strategy.now)
+    getattr(backtest, market_input).loc[strategy.now, "asset"] = np.nan
+    security_state = {name: getattr(security, name) for name in ("_position", "_needupdate", "_outlay", "_bidoffer_paid")}
+    strategy_state = {name: getattr(strategy, name) for name in ("_capital", "_last_fee", "stale")}
+    security_data = security.data.copy()
+    strategy_data = strategy.data.copy()
+    transactions = strategy.get_transactions().copy()
+
+    with pytest.raises(ValueError, match=market_input), np.errstate(all="raise"):
+        getattr(security, method)(amount)
+
+    assert {name: getattr(security, name) for name in security_state} == security_state
+    assert {name: getattr(strategy, name) for name in strategy_state} == strategy_state
+    pd.testing.assert_frame_equal(security.data, security_data)
+    pd.testing.assert_frame_equal(strategy.data, strategy_data)
+    pd.testing.assert_frame_equal(strategy.get_transactions(), transactions)
+
+
+def test_backtest_cost_model_does_not_pollute_legacy_path():
+    """Running a Backtest with a CostModel must not perturb the unmodified path."""
+    prices, volume, volatility = _impact_universe()
+
+    bt.run(
+        bt.Backtest(
+            _ew_strategy(),
+            prices,
+            commissions=bt.AlmgrenChrissCostModel(),
+            volume=volume,
+            volatility=volatility,
+            progress_bar=False,
+        )
+    )
+    legacy = bt.Backtest(_ew_strategy(), prices, progress_bar=False)
+    bt.run(legacy)
+
+    assert legacy.strategy.fees.sum() == 0.0
+
+
+def test_backtest_cost_model_cost_scales_with_qty_via_volume():
+    """Halving available volume (raising participation 10x) should raise AC depth/perm
+    cost roughly proportionally."""
+    prices, volume, volatility = _impact_universe()
+
+    base_vol = volume.copy()
+    thin_vol = volume / 10.0  # same trades execute at 10x participation
+
+    base = bt.Backtest(
+        _ew_strategy("base"),
+        prices,
+        commissions=bt.AlmgrenChrissCostModel(alpha=1, beta=1, epsilon=0.0),
+        volume=base_vol,
+        volatility=volatility,
+        initial_capital=10_000_000.0,
+        progress_bar=False,
+    )
+    thin = bt.Backtest(
+        _ew_strategy("thin"),
+        prices,
+        commissions=bt.AlmgrenChrissCostModel(alpha=1, beta=1, epsilon=0.0),
+        volume=thin_vol,
+        volatility=volatility,
+        initial_capital=10_000_000.0,
+        progress_bar=False,
+    )
+
+    bt.run(base, thin)
+
+    # AC depth + perm scale linearly in (|q|/V) -> 10x participation -> ~10x cost
+    assert thin.strategy.fees.sum() > 5 * base.strategy.fees.sum()

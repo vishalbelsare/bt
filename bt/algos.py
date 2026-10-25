@@ -1,19 +1,21 @@
 """
 A collection of Algos used to create Strategy logic.
 """
-from __future__ import division
 
 import abc
+import math
 import random
 import re
 
 import numpy as np
 import pandas as pd
 import sklearn.covariance
-from future.utils import iteritems
 
 import bt
 from bt.core import Algo, AlgoStack, SecurityBase, is_zero
+
+_DEFAULT_LOOKBACK = pd.DateOffset(months=3)
+_DEFAULT_LAG = pd.DateOffset(days=0)
 
 
 def run_always(f):
@@ -27,7 +29,6 @@ def run_always(f):
 
 
 class PrintDate(Algo):
-
     """
     This Algo simply print's the current date.
 
@@ -40,7 +41,6 @@ class PrintDate(Algo):
 
 
 class PrintTempData(Algo):
-
     """
     This Algo prints the temp data.
 
@@ -53,7 +53,7 @@ class PrintTempData(Algo):
     """
 
     def __init__(self, fmt_string=None):
-        super(PrintTempData, self).__init__()
+        super().__init__()
         self.fmt_string = fmt_string
 
     def __call__(self, target):
@@ -65,7 +65,6 @@ class PrintTempData(Algo):
 
 
 class PrintInfo(Algo):
-
     """
     Prints out info associated with the target strategy. Useful for debugging
     purposes.
@@ -85,7 +84,7 @@ class PrintInfo(Algo):
     """
 
     def __init__(self, fmt_string="{name} {now}"):
-        super(PrintInfo, self).__init__()
+        super().__init__()
         self.fmt_string = fmt_string
 
     def __call__(self, target):
@@ -94,7 +93,6 @@ class PrintInfo(Algo):
 
 
 class Debug(Algo):
-
     """
     Utility Algo that calls pdb.set_trace when triggered.
 
@@ -103,14 +101,13 @@ class Debug(Algo):
     """
 
     def __call__(self, target):
-        import pdb
+        import pdb  # noqa: T100
 
-        pdb.set_trace()
+        pdb.set_trace()  # noqa: T100
         return True
 
 
 class RunOnce(Algo):
-
     """
     Returns True on first run then returns False.
 
@@ -123,7 +120,7 @@ class RunOnce(Algo):
     """
 
     def __init__(self):
-        super(RunOnce, self).__init__()
+        super().__init__()
         self.has_run = False
 
     def __call__(self, target):
@@ -138,10 +135,17 @@ class RunOnce(Algo):
 
 
 class RunPeriod(Algo):
-    def __init__(
-        self, run_on_first_date=True, run_on_end_of_period=False, run_on_last_date=False
-    ):
-        super(RunPeriod, self).__init__()
+    """
+    Schedule from period boundaries in the supplied dates.
+
+    The first supplied date uses ``run_on_first_date``, even if it is also
+    the last. On other final dates, ``run_on_last_date=False`` skips execution
+    and ``True`` forces it. ``None`` uses the preceding date in beginning-of-period
+    mode, but returns False in end-of-period mode because no following date exists.
+    """
+
+    def __init__(self, run_on_first_date=True, run_on_end_of_period=False, run_on_last_date=False):
+        super().__init__()
         self._run_on_first_date = run_on_first_date
         self._run_on_end_of_period = run_on_end_of_period
         self._run_on_last_date = run_on_last_date
@@ -170,12 +174,11 @@ class RunPeriod(Algo):
         if index == 1:
             if self._run_on_first_date:
                 result = True
-        # last date
-        elif index == (len(target.data.index) - 1):
+        # None can compare the preceding bar, but cannot infer a missing successor.
+        elif index == (len(target.data.index) - 1) and (self._run_on_last_date is not None or self._run_on_end_of_period):
             if self._run_on_last_date:
                 result = True
         else:
-
             # create pandas.Timestamp for useful .week,.quarter properties
             now = pd.Timestamp(now)
 
@@ -196,7 +199,6 @@ class RunPeriod(Algo):
 
 
 class RunDaily(RunPeriod):
-
     """
     Returns True on day change.
 
@@ -204,7 +206,9 @@ class RunDaily(RunPeriod):
         * run_on_first_date (bool): determines if it runs the first time the algo is called
         * run_on_end_of_period (bool): determines if it should run at the end of the period
           or the beginning
-        * run_on_last_date (bool): determines if it runs on the last time the algo is called
+        * run_on_last_date (bool or None): False (default) skips the final supplied date;
+          True forces execution; None checks the preceding date, or returns False in
+          end-of-period mode. The first-date override takes precedence (see RunPeriod).
 
     Returns True if the target.now's day has changed
     compared to the last(or next if run_on_end_of_period) date, if not returns False.
@@ -213,13 +217,10 @@ class RunDaily(RunPeriod):
     """
 
     def compare_dates(self, now, date_to_compare):
-        if now.date() != date_to_compare.date():
-            return True
-        return False
+        return now.date() != date_to_compare.date()
 
 
 class RunWeekly(RunPeriod):
-
     """
     Returns True on week change.
 
@@ -227,7 +228,9 @@ class RunWeekly(RunPeriod):
         * run_on_first_date (bool): determines if it runs the first time the algo is called
         * run_on_end_of_period (bool): determines if it should run at the end of the period
           or the beginning
-        * run_on_last_date (bool): determines if it runs on the last time the algo is called
+        * run_on_last_date (bool or None): False (default) skips the final supplied date;
+          True forces execution; None checks the preceding date, or returns False in
+          end-of-period mode. The first-date override takes precedence (see RunPeriod).
 
     Returns True if the target.now's week has changed
     since relative to the last(or next) date, if not returns False. Useful for
@@ -236,13 +239,10 @@ class RunWeekly(RunPeriod):
     """
 
     def compare_dates(self, now, date_to_compare):
-        if now.year != date_to_compare.year or now.week != date_to_compare.week:
-            return True
-        return False
+        return now.isocalendar()[:2] != date_to_compare.isocalendar()[:2]
 
 
 class RunMonthly(RunPeriod):
-
     """
     Returns True on month change.
 
@@ -250,7 +250,9 @@ class RunMonthly(RunPeriod):
         * run_on_first_date (bool): determines if it runs the first time the algo is called
         * run_on_end_of_period (bool): determines if it should run at the end of the period
           or the beginning
-        * run_on_last_date (bool): determines if it runs on the last time the algo is called
+        * run_on_last_date (bool or None): False (default) skips the final supplied date;
+          True forces execution; None checks the preceding date, or returns False in
+          end-of-period mode. The first-date override takes precedence (see RunPeriod).
 
     Returns True if the target.now's month has changed
     since relative to the last(or next) date, if not returns False. Useful for
@@ -259,13 +261,10 @@ class RunMonthly(RunPeriod):
     """
 
     def compare_dates(self, now, date_to_compare):
-        if now.year != date_to_compare.year or now.month != date_to_compare.month:
-            return True
-        return False
+        return bool(now.year != date_to_compare.year or now.month != date_to_compare.month)
 
 
 class RunQuarterly(RunPeriod):
-
     """
     Returns True on quarter change.
 
@@ -273,7 +272,9 @@ class RunQuarterly(RunPeriod):
         * run_on_first_date (bool): determines if it runs the first time the algo is called
         * run_on_end_of_period (bool): determines if it should run at the end of the period
           or the beginning
-        * run_on_last_date (bool): determines if it runs on the last time the algo is called
+        * run_on_last_date (bool or None): False (default) skips the final supplied date;
+          True forces execution; None checks the preceding date, or returns False in
+          end-of-period mode. The first-date override takes precedence (see RunPeriod).
 
     Returns True if the target.now's quarter has changed
     since relative to the last(or next) date, if not returns False. Useful for
@@ -282,13 +283,10 @@ class RunQuarterly(RunPeriod):
     """
 
     def compare_dates(self, now, date_to_compare):
-        if now.year != date_to_compare.year or now.quarter != date_to_compare.quarter:
-            return True
-        return False
+        return bool(now.year != date_to_compare.year or now.quarter != date_to_compare.quarter)
 
 
 class RunYearly(RunPeriod):
-
     """
     Returns True on year change.
 
@@ -296,7 +294,9 @@ class RunYearly(RunPeriod):
         * run_on_first_date (bool): determines if it runs the first time the algo is called
         * run_on_end_of_period (bool): determines if it should run at the end of the period
           or the beginning
-        * run_on_last_date (bool): determines if it runs on the last time the algo is called
+        * run_on_last_date (bool or None): False (default) skips the final supplied date;
+          True forces execution; None checks the preceding date, or returns False in
+          end-of-period mode. The first-date override takes precedence (see RunPeriod).
 
     Returns True if the target.now's year has changed
     since relative to the last(or next) date, if not returns False. Useful for
@@ -305,13 +305,10 @@ class RunYearly(RunPeriod):
     """
 
     def compare_dates(self, now, date_to_compare):
-        if now.year != date_to_compare.year:
-            return True
-        return False
+        return now.year != date_to_compare.year
 
 
 class RunOnDate(Algo):
-
     """
     Returns True on a specific set of dates.
 
@@ -327,7 +324,7 @@ class RunOnDate(Algo):
               by pandas.to_datetime so pass anything that it can
               parse. Typically, you will pass a string 'yyyy-mm-dd'.
         """
-        super(RunOnDate, self).__init__()
+        super().__init__()
         # parse dates and save
         self.dates = [pd.to_datetime(d) for d in dates]
 
@@ -336,7 +333,6 @@ class RunOnDate(Algo):
 
 
 class RunAfterDate(Algo):
-
     """
     Returns True after a date has passed
 
@@ -354,7 +350,7 @@ class RunAfterDate(Algo):
         Args:
             * date: Date after which to start trading
         """
-        super(RunAfterDate, self).__init__()
+        super().__init__()
         # parse dates and save
         self.date = pd.to_datetime(date)
 
@@ -363,9 +359,10 @@ class RunAfterDate(Algo):
 
 
 class RunAfterDays(Algo):
-
     """
     Returns True after a specific number of 'warmup' trading days have passed
+
+    Repeated calls on the same date count as one trading day.
 
     Args:
         * days (int): Number of trading days to wait before starting
@@ -381,22 +378,31 @@ class RunAfterDays(Algo):
         Args:
             * days (int): Number of trading days to wait before starting
         """
-        super(RunAfterDays, self).__init__()
+        super().__init__()
         self.days = days
+        self.last_date = None
 
     def __call__(self, target):
         if self.days > 0:
-            self.days -= 1
+            if target.now != self.last_date:
+                self.days -= 1
+                self.last_date = target.now
             return False
-        return True
+        return self.last_date is None or bool(target.now != self.last_date)
 
 
 class RunIfOutOfBounds(Algo):
-
     """
-    This algo returns true if any of the target weights deviate by an amount greater
-    than tolerance. For example, it will be run if the tolerance is set to 0.5 and
-    a security grows from a target weight of 0.2 to greater than 0.3.
+    This algo returns true if any current or target weight deviates by an amount
+    greater than tolerance. For example, it will be run if the tolerance is set to
+    0.5 and a security grows from a target weight of 0.2 to greater than 0.3.
+    A missing current or target weight is treated as zero.
+    A zero target weight is out of bounds whenever the current weight is nonzero.
+    For ordinary strategies, an optional ``cash`` fraction scales the supplied
+    weights to the investable portion of total value and is checked against the
+    strategy's actual cash fraction. Fixed-income strategies ignore ``cash``.
+    A zero-value ordinary strategy is within its cash target only when its
+    capital is also zero.
 
     A strategy where rebalancing is performed quarterly or whenever any
     security's weight deviates by more than 20% could be implemented by:
@@ -413,25 +419,34 @@ class RunIfOutOfBounds(Algo):
 
     def __init__(self, tolerance):
         self.tolerance = float(tolerance)
-        super(RunIfOutOfBounds, self).__init__()
+        super().__init__()
 
     def __call__(self, target):
         if "weights" not in target.temp:
             return True
 
         targets = target.temp["weights"]
+        target_scale = 1.0
+        if "cash" in target.temp and not target.fixed_income:
+            target_scale -= target.temp["cash"]
 
-        for cname in target.children:
-            if cname in targets:
-                c = target.children[cname]
-                deviation = abs((c.weight - targets[cname]) / targets[cname])
-                if deviation > self.tolerance:
+        # Rebalance treats names missing from either side as zero weight.
+        for cname in target.children.keys() | targets.keys():
+            current_weight = target.children[cname].weight if cname in target.children else 0.0
+            target_weight = targets.get(cname, 0.0) * target_scale
+            if target_weight == 0:
+                if current_weight != 0:
                     return True
+                continue
+            deviation = (current_weight - target_weight) / target_weight
+            if deviation > self.tolerance or deviation < -self.tolerance:
+                return True
 
-        if "cash" in target.temp:
-            cash_deviation = abs(
-                (target.capital - targets.value) / targets.value - target.temp["cash"]
-            )
+        if "cash" in target.temp and not target.fixed_income:
+            value = target.value
+            if is_zero(value):
+                return not is_zero(target.capital)
+            cash_deviation = abs(target.capital / value - target.temp["cash"])
             if cash_deviation > self.tolerance:
                 return True
 
@@ -439,7 +454,6 @@ class RunIfOutOfBounds(Algo):
 
 
 class RunEveryNPeriods(Algo):
-
     """
     This algo runs every n periods.
 
@@ -457,7 +471,7 @@ class RunEveryNPeriods(Algo):
     """
 
     def __init__(self, n, offset=0):
-        super(RunEveryNPeriods, self).__init__()
+        super().__init__()
         self.n = n
         self.offset = offset
         self.idx = n - offset - 1
@@ -478,8 +492,18 @@ class RunEveryNPeriods(Algo):
                 return False
 
 
-class SelectAll(Algo):
+def _select_by_price(prices, candidates, include_no_data, include_negative):
+    """Return labels allowed by the independent data and price-sign flags."""
+    if include_no_data:
+        prices = prices.reindex(candidates)
+    else:
+        prices = prices.loc[candidates].dropna()
+    if not include_negative:
+        prices = prices[prices.isna() | (prices > 0)]
+    return list(prices.index)
 
+
+class SelectAll(Algo):
     """
     Sets temp['selected'] with all securities (based on universe).
 
@@ -497,24 +521,25 @@ class SelectAll(Algo):
     """
 
     def __init__(self, include_no_data=False, include_negative=False):
-        super(SelectAll, self).__init__()
+        super().__init__()
         self.include_no_data = include_no_data
         self.include_negative = include_negative
 
     def __call__(self, target):
-        if self.include_no_data:
+        if self.include_no_data and self.include_negative:
             target.temp["selected"] = target.universe.columns
         else:
-            universe = target.universe.loc[target.now].dropna()
-            if self.include_negative:
-                target.temp["selected"] = list(universe.index)
-            else:
-                target.temp["selected"] = list(universe[universe > 0].index)
+            prices = target.universe.loc[target.now]
+            target.temp["selected"] = _select_by_price(
+                prices,
+                target.universe.columns,
+                self.include_no_data,
+                self.include_negative,
+            )
         return True
 
 
 class SelectThese(Algo):
-
     """
     Sets temp['selected'] with a set list of tickers.
 
@@ -530,25 +555,21 @@ class SelectThese(Algo):
     """
 
     def __init__(self, tickers, include_no_data=False, include_negative=False):
-        super(SelectThese, self).__init__()
+        super().__init__()
         self.tickers = tickers
         self.include_no_data = include_no_data
         self.include_negative = include_negative
 
     def __call__(self, target):
-        if self.include_no_data:
+        if self.include_no_data and self.include_negative:
             target.temp["selected"] = self.tickers
         else:
-            universe = target.universe.loc[target.now, self.tickers].dropna()
-            if self.include_negative:
-                target.temp["selected"] = list(universe.index)
-            else:
-                target.temp["selected"] = list(universe[universe > 0].index)
+            prices = target.universe.loc[target.now]
+            target.temp["selected"] = _select_by_price(prices, self.tickers, self.include_no_data, self.include_negative)
         return True
 
 
 class SelectHasData(Algo):
-
     """
     Sets temp['selected'] based on all items in universe that meet
     data requirements.
@@ -586,12 +607,12 @@ class SelectHasData(Algo):
 
     def __init__(
         self,
-        lookback=pd.DateOffset(months=3),
+        lookback=_DEFAULT_LOOKBACK,
         min_count=None,
         include_no_data=False,
         include_negative=False,
     ):
-        super(SelectHasData, self).__init__()
+        super().__init__()
         self.lookback = lookback
         if min_count is None:
             min_count = bt.ffn.get_num_days_required(lookback)
@@ -608,16 +629,12 @@ class SelectHasData(Algo):
         filt = target.universe.loc[target.now - self.lookback :, selected]
         cnt = filt.count()
         cnt = cnt[cnt >= self.min_count]
-        if not self.include_no_data:
-            cnt = cnt[~target.universe.loc[target.now, selected].isnull()]
-            if not self.include_negative:
-                cnt = cnt[target.universe.loc[target.now, selected] > 0]
-        target.temp["selected"] = list(cnt.index)
+        prices = target.universe.loc[target.now]
+        target.temp["selected"] = _select_by_price(prices, cnt.index, self.include_no_data, self.include_negative)
         return True
 
 
 class SelectN(Algo):
-
     """
     Sets temp['selected'] based on ranking temp['stat'].
 
@@ -643,10 +660,8 @@ class SelectN(Algo):
 
     """
 
-    def __init__(
-        self, n, sort_descending=True, all_or_none=False, filter_selected=False
-    ):
-        super(SelectN, self).__init__()
+    def __init__(self, n, sort_descending=True, all_or_none=False, filter_selected=False):
+        super().__init__()
         if n < 0:
             raise ValueError("n cannot be negative")
         self.n = n
@@ -676,7 +691,6 @@ class SelectN(Algo):
 
 
 class SelectMomentum(AlgoStack):
-
     """
     Sets temp['selected'] based on a simple momentum filter.
 
@@ -689,12 +703,14 @@ class SelectMomentum(AlgoStack):
 
     Args:
         * n (int): select first N elements
-        * lookback (DateOffset): lookback period for total return
-          calculation
+        * lookback (DateOffset|sequence): lookback period for total return
+          calculation, or a sequence of periods whose returns are averaged
         * lag (DateOffset): Lag interval for total return calculation
         * sort_descending (bool): Sort descending (highest return is best)
         * all_or_none (bool): If true, only populates temp['selected'] if we
           have n items. If we have less than n, then temp['selected'] = [].
+        * weights (sequence): Optional finite, non-negative weights for multiple
+          lookback periods. Their sum must be finite and positive.
 
     Sets:
         * selected
@@ -707,27 +723,42 @@ class SelectMomentum(AlgoStack):
     def __init__(
         self,
         n,
-        lookback=pd.DateOffset(months=3),
-        lag=pd.DateOffset(days=0),
+        lookback=_DEFAULT_LOOKBACK,
+        lag=_DEFAULT_LAG,
         sort_descending=True,
         all_or_none=False,
+        weights=None,
     ):
-        super(SelectMomentum, self).__init__(
-            StatTotalReturn(lookback=lookback, lag=lag),
+        if isinstance(lookback, (list, tuple, np.ndarray, pd.Index)):
+            stat = StatMultiPeriodReturn(lookbacks=lookback, weights=weights, lag=lag)
+        else:
+            if weights is not None:
+                raise ValueError("weights require multiple lookback periods")
+            stat = StatTotalReturn(lookback=lookback, lag=lag)
+
+        super().__init__(
+            stat,
             SelectN(n=n, sort_descending=sort_descending, all_or_none=all_or_none),
         )
 
 
 class SelectWhere(Algo):
-
     """
     Selects securities based on an indicator DataFrame.
 
     Selects securities where the value is True on the current date
-    (target.now) only if current date is present in signal DataFrame.
+    (target.now). If the date is absent from the signal DataFrame, returns
+    False to stop the AlgoStack. A present all-False row remains a valid empty
+    selection and returns True.
 
     For example, this could be the result of a pandas boolean comparison such
     as data > 100.
+
+    Warning:
+        Signals derived from fundamental data are only point-in-time safe when
+        the data contains values known on each historical date. Data containing
+        later restatements introduces look-ahead bias. SelectWhere evaluates the
+        supplied signal as-is and cannot detect or correct restated values.
 
     Args:
         * signal (str|DataFrame): Boolean DataFrame containing selection logic.
@@ -743,7 +774,7 @@ class SelectWhere(Algo):
     """
 
     def __init__(self, signal, include_no_data=False, include_negative=False):
-        super(SelectWhere, self).__init__()
+        super().__init__()
         if isinstance(signal, pd.DataFrame):
             self.signal_name = None
             self.signal = signal
@@ -765,21 +796,18 @@ class SelectWhere(Algo):
             sig = signal.loc[target.now]
             # get tickers where True
             # selected = sig.index[sig]
-            selected = sig[sig == True].index  # noqa: E712
+            selected = sig[sig == True].index
             # save as list
-            if not self.include_no_data:
-                universe = target.universe.loc[target.now, list(selected)].dropna()
-                if self.include_negative:
-                    selected = list(universe.index)
-                else:
-                    selected = list(universe[universe > 0].index)
+            prices = target.universe.loc[target.now]
+            selected = _select_by_price(prices, selected, self.include_no_data, self.include_negative)
             target.temp["selected"] = list(selected)
+            return True
 
-        return True
+        # Stop downstream Algos when no signal row exists for the current date.
+        return False
 
 
 class SelectRandomly(AlgoStack):
-
     """
     Sets temp['selected'] based on a random subset of
     the items currently in temp['selected'].
@@ -812,7 +840,7 @@ class SelectRandomly(AlgoStack):
     """
 
     def __init__(self, n=None, include_no_data=False, include_negative=False):
-        super(SelectRandomly, self).__init__()
+        super().__init__()
         self.n = n
         self.include_no_data = include_no_data
         self.include_negative = include_negative
@@ -823,23 +851,19 @@ class SelectRandomly(AlgoStack):
         else:
             sel = list(target.universe.columns)
 
-        if not self.include_no_data:
-            universe = target.universe.loc[target.now, sel].dropna()
-            if self.include_negative:
-                sel = list(universe.index)
-            else:
-                sel = list(universe[universe > 0].index)
+        if not (self.include_no_data and self.include_negative):
+            prices = target.universe.loc[target.now]
+            sel = _select_by_price(prices, sel, self.include_no_data, self.include_negative)
 
         if self.n is not None:
-            n = self.n if self.n < len(sel) else len(sel)
-            sel = random.sample(sel, int(n))
+            n = min(len(sel), self.n)
+            sel = random.sample(list(sel), int(n))
 
         target.temp["selected"] = sel
         return True
 
 
 class SelectRegex(Algo):
-
     """
     Sets temp['selected'] based on a regex on their names.
     Useful when working with a large universe of different kinds of securities
@@ -855,7 +879,7 @@ class SelectRegex(Algo):
     """
 
     def __init__(self, regex):
-        super(SelectRegex, self).__init__()
+        super().__init__()
         self.regex = re.compile(regex)
 
     def __call__(self, target):
@@ -866,7 +890,6 @@ class SelectRegex(Algo):
 
 
 class ResolveOnTheRun(Algo):
-
     """
     Looks at securities set in temp['selected'] and searches for names that
     match the names of "aliases" for on-the-run securities in the provided
@@ -891,7 +914,7 @@ class ResolveOnTheRun(Algo):
     """
 
     def __init__(self, on_the_run, include_no_data=False, include_negative=False):
-        super(ResolveOnTheRun, self).__init__()
+        super().__init__()
         self.on_the_run = on_the_run
         self.include_no_data = include_no_data
         self.include_negative = include_negative
@@ -902,20 +925,13 @@ class ResolveOnTheRun(Algo):
         selected = target.temp["selected"]
         aliases = [s for s in selected if s in on_the_run.columns]
         resolved = on_the_run.loc[target.now, aliases].tolist()
-        if not self.include_no_data:
-            universe = target.universe.loc[target.now, resolved].dropna()
-            if self.include_negative:
-                resolved = list(universe.index)
-            else:
-                resolved = list(universe[universe > 0].index)
-        target.temp["selected"] = resolved + [
-            s for s in selected if s not in on_the_run.columns
-        ]
+        prices = target.universe.loc[target.now]
+        resolved = _select_by_price(prices, resolved, self.include_no_data, self.include_negative)
+        target.temp["selected"] = resolved + [s for s in selected if s not in on_the_run.columns]
         return True
 
 
 class SetStat(Algo):
-
     """
     Sets temp['stat'] for use by downstream algos (such as SelectN).
 
@@ -923,11 +939,15 @@ class SetStat(Algo):
         * stat (str|DataFrame): A dataframe of the same dimension as target.universe
           If a string is passed, frame is accessed using target.get_data
           This is the preferred way of using the algo.
+        * lag (DateOffset): Lag interval. The stat used today is the one calculated
+          at today - lag
     Sets:
         * stat
     """
 
-    def __init__(self, stat):
+    def __init__(self, stat, lag=_DEFAULT_LAG):
+        super().__init__()
+        self.lag = lag
         if isinstance(stat, pd.DataFrame):
             self.stat_name = None
             self.stat = stat
@@ -940,12 +960,16 @@ class SetStat(Algo):
             stat = self.stat
         else:
             stat = target.get_data(self.stat_name)
-        target.temp["stat"] = stat.loc[target.now]
+
+        t0 = target.now - self.lag
+        if t0 not in stat.index:
+            return False
+
+        target.temp["stat"] = stat.loc[t0]
         return True
 
 
 class StatTotalReturn(Algo):
-
     """
     Sets temp['stat'] with total returns over a given period.
 
@@ -966,21 +990,93 @@ class StatTotalReturn(Algo):
 
     """
 
-    def __init__(self, lookback=pd.DateOffset(months=3), lag=pd.DateOffset(days=0)):
-        super(StatTotalReturn, self).__init__()
+    def __init__(self, lookback=_DEFAULT_LOOKBACK, lag=_DEFAULT_LAG):
+        super().__init__()
         self.lookback = lookback
         self.lag = lag
 
     def __call__(self, target):
         selected = target.temp["selected"]
         t0 = target.now - self.lag
+        if target.universe[selected].index[0] > t0:
+            return False
         prc = target.universe.loc[t0 - self.lookback : t0, selected]
         target.temp["stat"] = prc.calc_total_return()
         return True
 
 
-class WeighEqually(Algo):
+class StatMultiPeriodReturn(Algo):
+    """
+    Sets temp['stat'] to the weighted average of multiple total returns.
 
+    Args:
+        * lookbacks (sequence): DateOffset lookback periods.
+        * weights (sequence): Optional finite, non-negative weight for each
+          lookback. Their sum must be finite and positive. Equal weights are
+          used by default and normalized to sum to one.
+        * lag (DateOffset): Lag interval. Each total return ends at now - lag.
+
+    Sets:
+        * stat
+
+    Requires:
+        * selected
+    """
+
+    def __init__(self, lookbacks, weights=None, lag=_DEFAULT_LAG):
+        super().__init__()
+        self.lookbacks = list(lookbacks)
+        if not self.lookbacks:
+            raise ValueError("lookbacks cannot be empty")
+
+        if weights is None:
+            weights = np.ones(len(self.lookbacks))
+        elif len(weights) != len(self.lookbacks):
+            raise ValueError("weights and lookbacks must have the same length")
+
+        weights = np.asarray(weights, dtype=float)
+        if not np.all(np.isfinite(weights)):
+            raise ValueError("weights and their sum must be finite")
+        # Check the aggregate too because finite values can overflow when summed.
+        with np.errstate(over="ignore"):
+            weight_sum = weights.sum()
+        if not np.isfinite(weight_sum):
+            raise ValueError("weights and their sum must be finite")
+        if np.any(weights < 0):
+            raise ValueError("weights must be non-negative")
+        if weight_sum == 0:
+            raise ValueError("weights must not sum to zero")
+        self.weights = weights / weight_sum
+        self.lag = lag
+
+    def __call__(self, target):
+        selected = target.temp["selected"]
+        t0 = target.now - self.lag
+        universe = target.universe
+        prices = universe[selected]
+        if prices.index[0] > t0:
+            return False
+
+        # Reuse selected columns to avoid repeating wide-universe indexing for each
+        # lookback. Other inputs retain observable selector, offset, and universe reads.
+        # Metadata-bearing columns also retain per-lookup pandas warnings.
+        if (
+            type(target) in (bt.Strategy, bt.FixedIncomeStrategy)
+            and type(universe) is pd.DataFrame
+            and not isinstance(universe.columns, (pd.MultiIndex, pd.CategoricalIndex))
+            and type(selected) is list
+            and all(type(label) is str for label in selected)
+            and type(self.lookbacks) is list
+            and all(type(lookback) is pd.DateOffset for lookback in self.lookbacks)
+        ):
+            returns = [prices.loc[t0 - lookback : t0].calc_total_return() for lookback in self.lookbacks]
+        else:
+            returns = [target.universe.loc[t0 - lookback : t0, selected].calc_total_return() for lookback in self.lookbacks]
+        target.temp["stat"] = pd.concat(returns, axis=1).dot(self.weights)
+        return True
+
+
+class WeighEqually(Algo):
     """
     Sets temp['weights'] by calculating equal weights for all items in
     selected.
@@ -996,7 +1092,7 @@ class WeighEqually(Algo):
     """
 
     def __init__(self):
-        super(WeighEqually, self).__init__()
+        super().__init__()
 
     def __call__(self, target):
         selected = target.temp["selected"]
@@ -1012,7 +1108,6 @@ class WeighEqually(Algo):
 
 
 class WeighSpecified(Algo):
-
     """
     Sets temp['weights'] based on a provided dict of ticker:weights.
 
@@ -1027,7 +1122,7 @@ class WeighSpecified(Algo):
     """
 
     def __init__(self, **weights):
-        super(WeighSpecified, self).__init__()
+        super().__init__()
         self.weights = weights
 
     def __call__(self, target):
@@ -1037,7 +1132,6 @@ class WeighSpecified(Algo):
 
 
 class ScaleWeights(Algo):
-
     """
     Sets temp['weights'] based on a scaled version of itself.
     Useful for going short, or scaling up/down when using
@@ -1055,18 +1149,15 @@ class ScaleWeights(Algo):
     """
 
     def __init__(self, scale):
-        super(ScaleWeights, self).__init__()
+        super().__init__()
         self.scale = scale
 
     def __call__(self, target):
-        target.temp["weights"] = {
-            k: self.scale * w for k, w in iteritems(target.temp["weights"])
-        }
+        target.temp["weights"] = {k: self.scale * w for k, w in target.temp["weights"].items()}
         return True
 
 
 class WeighTarget(Algo):
-
     """
     Sets target weights based on a target weight DataFrame.
 
@@ -1093,7 +1184,7 @@ class WeighTarget(Algo):
     """
 
     def __init__(self, weights):
-        super(WeighTarget, self).__init__()
+        super().__init__()
         if isinstance(weights, pd.DataFrame):
             self.weights_name = None
             self.weights = weights
@@ -1109,10 +1200,20 @@ class WeighTarget(Algo):
             weights = target.get_data(self.weights_name)
 
         if target.now in weights.index:
-            w = weights.loc[target.now]
+            w = weights.loc[target.now].dropna()
 
-            # dropna and save
-            target.temp["weights"] = w.dropna()
+            # Promote the contiguous exact-integer range for fractional modifiers.
+            # Python-int bounds avoid rounding uint64 comparisons in NumPy.
+            if (
+                type(weights) is pd.DataFrame
+                and type(w) is pd.Series
+                and pd.api.types.is_integer_dtype(w.dtype)
+                and not w.empty
+                and -(2**53) <= int(w.min())
+                and int(w.max()) <= 2**53
+            ):
+                w = w.astype(float)
+            target.temp["weights"] = w
 
             return True
         else:
@@ -1120,17 +1221,21 @@ class WeighTarget(Algo):
 
 
 class WeighInvVol(Algo):
-
     """
     Sets temp['weights'] based on the inverse volatility Algo.
 
     Sets the target weights based on ffn's calc_inv_vol_weights. This
     is a commonly used technique for risk parity portfolios. The least
     volatile elements receive the highest weight under this scheme. Weights
-    are proportional to the inverse of their volatility.
+    are proportional to the inverse of their volatility. Each asset's
+    volatility estimate uses its own available returns.
 
     Args:
-        * lookback (DateOffset): lookback period for estimating volatility
+        * lookback (DateOffset or int): volatility estimation window. Defaults
+          to three calendar months. A positive integer counts price rows
+          (N rows give at most N-1 returns), ending at the last row on or before
+          now minus lag. Uses all available rows if fewer than N exist.
+        * lag (DateOffset): offset from now to the window's end (default zero).
 
     Sets:
         * weights
@@ -1140,8 +1245,10 @@ class WeighInvVol(Algo):
 
     """
 
-    def __init__(self, lookback=pd.DateOffset(months=3), lag=pd.DateOffset(days=0)):
-        super(WeighInvVol, self).__init__()
+    def __init__(self, lookback=_DEFAULT_LOOKBACK, lag=_DEFAULT_LAG):
+        super().__init__()
+        if isinstance(lookback, (bool, np.bool_)) or (isinstance(lookback, (int, np.integer)) and lookback <= 0):
+            raise ValueError("lookback must be a positive integer when counting price rows")
         self.lookback = lookback
         self.lag = lag
 
@@ -1157,14 +1264,23 @@ class WeighInvVol(Algo):
             return True
 
         t0 = target.now - self.lag
-        prc = target.universe.loc[t0 - self.lookback : t0, selected]
-        tw = bt.ffn.calc_inv_vol_weights(prc.to_returns().dropna())
+        if isinstance(self.lookback, (int, np.integer)):
+            prc = target.universe.loc[:t0].iloc[-int(self.lookback) :].loc[:, selected]
+        else:
+            prc = target.universe.loc[t0 - self.lookback : t0, selected]
+        returns = prc.to_returns()
+        # Explicit axis=0 to compute per-column std and avoid FutureWarning
+        # from pandas (axis=None will reduce over both axes in a future version)
+        # pandas 1.x reduces nullable columns to an object Series containing pd.NA.
+        # Normalize missing values before NumPy's isinf check.
+        vol = (1.0 / returns.std(axis=0, ddof=1)).fillna(np.nan).astype(float)
+        vol[np.isinf(vol)] = np.nan
+        tw = vol / vol.sum()
         target.temp["weights"] = tw.dropna()
         return True
 
 
 class WeighERC(Algo):
-
     """
     Sets temp['weights'] based on equal risk contribution algorithm.
 
@@ -1204,17 +1320,16 @@ class WeighERC(Algo):
 
     def __init__(
         self,
-        lookback=pd.DateOffset(months=3),
+        lookback=_DEFAULT_LOOKBACK,
         initial_weights=None,
         risk_weights=None,
         covar_method="ledoit-wolf",
         risk_parity_method="ccd",
         maximum_iterations=100,
         tolerance=1e-8,
-        lag=pd.DateOffset(days=0),
+        lag=_DEFAULT_LAG,
     ):
-
-        super(WeighERC, self).__init__()
+        super().__init__()
         self.lookback = lookback
         self.initial_weights = initial_weights
         self.risk_weights = risk_weights
@@ -1252,7 +1367,6 @@ class WeighERC(Algo):
 
 
 class WeighMeanVar(Algo):
-
     """
     Sets temp['weights'] based on mean-variance optimization.
 
@@ -1276,17 +1390,20 @@ class WeighMeanVar(Algo):
     Requires:
         * selected
 
+    Raises:
+        * ValueError: If a single selected asset cannot satisfy the weight bounds.
+
     """
 
     def __init__(
         self,
-        lookback=pd.DateOffset(months=3),
+        lookback=_DEFAULT_LOOKBACK,
         bounds=(0.0, 1.0),
         covar_method="ledoit-wolf",
         rf=0.0,
-        lag=pd.DateOffset(days=0),
+        lag=_DEFAULT_LAG,
     ):
-        super(WeighMeanVar, self).__init__()
+        super().__init__()
         self.lookback = lookback
         self.lag = lag
         self.bounds = bounds
@@ -1301,6 +1418,12 @@ class WeighMeanVar(Algo):
             return True
 
         if len(selected) == 1:
+            if self.bounds is not None:
+                # Match the solver's scalar bounds; a fully invested singleton must
+                # weigh one even when no return history is available.
+                lower, upper = (float(bound.item() if isinstance(bound, np.ndarray) else bound) if bound is not None else None for bound in self.bounds)
+                if (lower is not None and lower > 1.0) or (upper is not None and upper < 1.0):
+                    raise ValueError("Weight bounds must include 1 for a single selected asset.")
             target.temp["weights"] = {selected[0]: 1.0}
             return True
 
@@ -1318,7 +1441,6 @@ class WeighMeanVar(Algo):
 
 
 class WeighRandomly(Algo):
-
     """
     Sets temp['weights'] based on a random weight vector.
 
@@ -1344,10 +1466,14 @@ class WeighRandomly(Algo):
     Requires:
         * selected
 
+    Raises:
+        * ValueError: If the bounds cannot produce the requested weight sum for
+          the selected securities.
+
     """
 
     def __init__(self, bounds=(0.0, 1.0), weight_sum=1):
-        super(WeighRandomly, self).__init__()
+        super().__init__()
         self.bounds = bounds
         self.weight_sum = weight_sum
 
@@ -1355,19 +1481,17 @@ class WeighRandomly(Algo):
         sel = target.temp["selected"]
         n = len(sel)
 
-        w = {}
-        try:
-            rw = bt.ffn.random_weights(n, self.bounds, self.weight_sum)
-            w = dict(zip(sel, rw))
-        except ValueError:
-            pass
+        # No selection is a valid target state, independent of the requested sum.
+        if n == 0:
+            target.temp["weights"] = {}
+            return True
 
-        target.temp["weights"] = w
+        rw = bt.ffn.random_weights(n, self.bounds, self.weight_sum)
+        target.temp["weights"] = dict(zip(sel, rw))
         return True
 
 
 class LimitDeltas(Algo):
-
     """
     Modifies temp['weights'] based on weight delta limits.
 
@@ -1380,6 +1504,10 @@ class LimitDeltas(Algo):
     security, and the weighing Algo sets the new weight to 0%, but we
     use this Algo with a limit of 0.1, the new target weight will
     be 90% instead of 0%.
+
+    For ordinary strategies reserving cash, targets and limits are relative to
+    the investable portion, as in Rebalance. Fixed-income strategies ignore cash.
+    A full cash reserve still closes positions immediately when rebalanced.
 
     Args:
         * limit (float, dict): Weight delta limit. If float, this will be a
@@ -1395,7 +1523,7 @@ class LimitDeltas(Algo):
     """
 
     def __init__(self, limit=0.1):
-        super(LimitDeltas, self).__init__()
+        super().__init__()
         self.limit = limit
         # determine if global or specific
         self.global_limit = True
@@ -1406,9 +1534,17 @@ class LimitDeltas(Algo):
         tw = target.temp["weights"]
         all_keys = set(list(target.children.keys()) + list(tw.keys()))
 
+        # Use the same investable-slice coordinates as RebalanceOverTime.
+        scale = 1.0
+        if "cash" in target.temp and not target.fixed_income:
+            scale -= target.temp["cash"]
+            # Rebalance handles full cash by closing positions immediately.
+            if scale == 0.0:
+                scale = 1.0
+
         for k in all_keys:
-            tgt = tw[k] if k in tw else 0.0
-            cur = target.children[k].weight if k in target.children else 0.0
+            tgt = tw.get(k, 0.0)
+            cur = target.children[k].weight / scale if k in target.children else 0.0
             delta = tgt - cur
 
             # check if we need to limit
@@ -1426,7 +1562,6 @@ class LimitDeltas(Algo):
 
 
 class LimitWeights(Algo):
-
     """
     Modifies temp['weights'] based on weight limits.
 
@@ -1451,7 +1586,7 @@ class LimitWeights(Algo):
     """
 
     def __init__(self, limit=0.1):
-        super(LimitWeights, self).__init__()
+        super().__init__()
         self.limit = limit
 
     def __call__(self, target):
@@ -1472,6 +1607,22 @@ class LimitWeights(Algo):
         return True
 
 
+def _estimate_covariance(algo, returns):
+    """Share pairwise and complete-case sampling policy between volatility Algos."""
+    # Keep branch-local selector reads observable to Algo subclasses.
+    if algo.covar_method == "ledoit-wolf":
+        covar = pd.DataFrame(
+            sklearn.covariance.ledoit_wolf(returns.dropna())[0],
+            index=returns.columns,
+            columns=returns.columns,
+        )
+    elif algo.covar_method == "standard":
+        covar = returns.cov()
+    else:
+        raise NotImplementedError("covar_method not implemented")
+    return covar
+
+
 class TargetVol(Algo):
     """
     Updates temp['weights'] based on the target annualized volatility desired.
@@ -1490,19 +1641,22 @@ class TargetVol(Algo):
     Requires:
         * temp['weights']
 
+    Raises:
+        * ValueError: if an applicable target or the estimated portfolio
+          volatility is non-finite, or if the estimated volatility is zero
+          when an applicable non-zero target is requested.
 
     """
 
     def __init__(
         self,
         target_volatility,
-        lookback=pd.DateOffset(months=3),
-        lag=pd.DateOffset(days=0),
+        lookback=_DEFAULT_LOOKBACK,
+        lag=_DEFAULT_LAG,
         covar_method="standard",
         annualization_factor=252,
     ):
-
-        super(TargetVol, self).__init__()
+        super().__init__()
         self.target_volatility = target_volatility
         self.lookback = lookback
         self.lag = lag
@@ -1510,7 +1664,6 @@ class TargetVol(Algo):
         self.annualization_factor = annualization_factor
 
     def __call__(self, target):
-
         current_weights = target.temp["weights"]
         selected = current_weights.keys()
 
@@ -1522,33 +1675,38 @@ class TargetVol(Algo):
         prc = target.universe.loc[t0 - self.lookback : t0, selected]
         returns = bt.ffn.to_returns(prc)
 
-        # calc covariance matrix
-        if self.covar_method == "ledoit-wolf":
-            covar = sklearn.covariance.ledoit_wolf(returns)
-        elif self.covar_method == "standard":
-            covar = returns.cov()
-        else:
-            raise NotImplementedError("covar_method not implemented")
+        covar = _estimate_covariance(self, returns)
 
-        weights = pd.Series(
-            [current_weights[x] for x in covar.columns], index=covar.columns
-        )
+        weights = pd.Series([current_weights[x] for x in covar.columns], index=covar.columns)
 
-        vol = np.sqrt(
-            np.matmul(weights.values.T, np.matmul(covar.values, weights.values))
-            * self.annualization_factor
-        )
+        vol = np.sqrt(np.matmul(weights.values.T, np.matmul(covar.values, weights.values)) * self.annualization_factor)
 
+        # Series iteration yields values; target lookup and scaling require labels.
         if isinstance(self.target_volatility, (float, int)):
-            self.target_volatility = {
-                k: self.target_volatility for k in target.temp["weights"].keys()
-            }
+            target_volatility = {k: self.target_volatility for k in selected}
+        else:
+            target_volatility = self.target_volatility
 
-        for k in target.temp["weights"].keys():
-            if k in self.target_volatility.keys():
-                target.temp["weights"][k] = (
-                    target.temp["weights"][k] * self.target_volatility[k] / vol
-                )
+        # A target mapping may intentionally omit some or all current weights.
+        applicable_target_volatilities: list[float] = [target_volatility[k] for k in selected if k in target_volatility]
+        if not applicable_target_volatilities:
+            return True
+
+        if not np.isfinite(applicable_target_volatilities).all():
+            raise ValueError("Cannot target a non-finite target volatility")
+
+        if not np.isfinite(vol):
+            raise ValueError("Cannot target volatility from a non-finite portfolio volatility")
+
+        if vol == 0:
+            # Scaling cannot create volatility from zero; zero is already a valid target.
+            if any(value != 0 for value in applicable_target_volatilities):
+                raise ValueError("Cannot target a non-zero volatility from a zero-volatility portfolio")
+            return True
+
+        for k in selected:
+            if k in target_volatility:
+                target.temp["weights"][k] = target.temp["weights"][k] * target_volatility[k] / vol
 
         return True
 
@@ -1556,6 +1714,9 @@ class TargetVol(Algo):
 class PTE_Rebalance(Algo):
     """
     Triggers a rebalance when PTE from static weights is past a level.
+
+    Current weights sum each Security's multiplier-aware exposure by name,
+    including same-name holdings in different strategy sleeves.
 
     Args:
         * PTE_volatility_cap: annualized volatility to target
@@ -1572,13 +1733,12 @@ class PTE_Rebalance(Algo):
         self,
         PTE_volatility_cap,
         target_weights,
-        lookback=pd.DateOffset(months=3),
-        lag=pd.DateOffset(days=0),
+        lookback=_DEFAULT_LOOKBACK,
+        lag=_DEFAULT_LAG,
         covar_method="standard",
         annualization_factor=252,
     ):
-
-        super(PTE_Rebalance, self).__init__()
+        super().__init__()
         self.PTE_volatility_cap = PTE_volatility_cap
         self.target_weights = target_weights
         self.lookback = lookback
@@ -1587,7 +1747,6 @@ class PTE_Rebalance(Algo):
         self.annualization_factor = annualization_factor
 
     def __call__(self, target):
-
         if target.now is None:
             return False
 
@@ -1601,12 +1760,17 @@ class PTE_Rebalance(Algo):
         if prices is None:
             return True
 
-        current_weights = positions * prices / target.value
+        # Same-name holdings can have different contract sizes; value each before summing.
+        current_values = {}
+        for security in target.securities:
+            value = security.position * prices[security.name] * security.multiplier
+            current_values[security.name] = current_values.get(security.name, 0.0) + value
+        current_weights = pd.Series(current_values) / target.value
 
         target_weights = self.target_weights.loc[target.now, :]
 
         cols = list(current_weights.index.copy())
-        for c in target_weights.keys():
+        for c in target_weights.keys():  # noqa: SIM118
             if c not in cols:
                 cols.append(c)
 
@@ -1621,45 +1785,50 @@ class PTE_Rebalance(Algo):
         prc = target.universe.loc[t0 - self.lookback : t0, cols]
         returns = bt.ffn.to_returns(prc)
 
-        # calc covariance matrix
-        if self.covar_method == "ledoit-wolf":
-            covar = sklearn.covariance.ledoit_wolf(returns)
-        elif self.covar_method == "standard":
-            covar = returns.cov()
-        else:
-            raise NotImplementedError("covar_method not implemented")
+        covar = _estimate_covariance(self, returns)
 
-        PTE_vol = np.sqrt(
-            np.matmul(weights.values.T, np.matmul(covar.values, weights.values))
-            * self.annualization_factor
-        )
+        PTE_vol = np.sqrt(np.matmul(weights.values.T, np.matmul(covar.values, weights.values)) * self.annualization_factor)
 
         if pd.isnull(PTE_vol):
             return False
         # vol is too high
-        if PTE_vol > self.PTE_volatility_cap:
-            return True
-        else:
-            return False
+        return PTE_vol > self.PTE_volatility_cap
 
         return True
 
 
 class CapitalFlow(Algo):
-
     """
     Used to model capital flows. Flows can either be inflows or outflows.
 
     This Algo can be used to model capital flows. For example, a pension
     fund might have inflows every month or year due to contributions. This
-    Algo will affect the capital of the target node without affecting returns
-    for the node.
+    Algo adjusts the capital of the target node. External flows are intended
+    to be excluded from investment returns, subject to the limitations below.
 
     Since this is modeled as an adjustment, the capital will remain in the
     strategy until a re-allocation/rebalancement is made.
 
+    The amount must be finite. Nonfinite amounts raise ValueError when the
+    Algo runs, before the target's accounting state changes.
+
     Args:
         * amount (float): Amount of adjustment
+
+    Note:
+        Known calculation defect: In ordinary value-based strategies, external
+        capital flows can incorrectly change reported investment returns.
+        These flows should be return-neutral. Backtest marks prices before
+        running Algos, and the current calculation can misstate returns when
+        capital is added or withdrawn after that mark.
+
+        For example, if 1000 invested grows to 1100, a subsequent contribution
+        of 500 leaves account value at 1600 but reports approximately 6.67%
+        return rather than 10%. Withdrawing the original 1000 instead raises
+        ZeroDivisionError even though account value remains positive at 100.
+
+        Use ``strategy.values`` to inspect account value separately; it does
+        not correct price-based performance statistics.
 
     """
 
@@ -1670,7 +1839,7 @@ class CapitalFlow(Algo):
         Args:
             * amount (float): Amount to adjust by
         """
-        super(CapitalFlow, self).__init__()
+        super().__init__()
         self.amount = float(amount)
 
     def __call__(self, target):
@@ -1678,8 +1847,91 @@ class CapitalFlow(Algo):
         return True
 
 
-class CloseDead(Algo):
+class CorporateActions(Algo):
+    """
+    Used to model dividends and share splits.
 
+    This Algo can be used to model dividend flows and share splits. This
+    allows the backtest to be run using unadjusted price data and to get
+    historically correct transactions (position sizes and commissions).
+
+    Security positions are adjusted on dates where a split value other than
+    1.0 is given. A value above 1.0 causes the position size to increase
+    (compared to the previous date) and vice versa. Split-adjusted values and
+    weights are available to subsequent Algos in the same iteration.
+
+    On a given date, a position on a security causes a cash inflow (when
+    long) or outflow (when short) given by the size of the position times
+    the amount in the `dividends` dataframe. Cash adjustments are made on
+    the `ex` date given as input, since payment date information is not
+    easily obtainable.
+
+    Applicable split ratios and dividends must be finite. Nonfinite values
+    raise ValueError before either action changes portfolio state. Missing
+    values retain the no-action meanings described below.
+
+    This Algo must run at every iteration to be able to change security
+    positions as required by splits. All dates in the `dividends`and
+    `splits` dataframes must exist in the price data for the calculations
+    to work correctly.
+
+    Args:
+        * dividends (dataframe): dataframe of dividend amounts per unit of
+          security, indexed by `ex` date. Values should be 0.0 or NaN when
+          there is no dividend.
+        * splits (dataframe): dataframe of split ratios from previous date.
+          Values should be 1.0 or NaN when there is no split.
+
+    """
+
+    def __init__(self, dividends, splits):
+        super().__init__()
+        self.dividends = dividends.fillna(0.0)
+        self.splits = splits.fillna(1.0)
+
+    def __call__(self, target):
+        split_row = dividend_row = None
+        if target.now in self.splits.index:
+            split_row = self.splits.loc[target.now]
+            # Mixed-dtype rows can promote scalars and change position arithmetic.
+            if not self.splits.dtypes.eq(split_row.dtype).all():
+                split_row = {c: self.splits.loc[target.now, c] for c in target.children if c in self.splits.columns}
+        if target.now in self.dividends.index:
+            dividend_row = self.dividends.loc[target.now]
+            if not self.dividends.dtypes.eq(dividend_row.dtype).all():
+                dividend_row = {c: self.dividends.loc[target.now, c] for c in target.children if c in self.dividends.columns}
+
+        # Check both action sets before the first split can change portfolio state.
+        for c in target.children:
+            if split_row is not None and c in self.splits.columns and not math.isfinite(split_row[c]):
+                raise ValueError("Corporate action split ratio must be finite")
+            if dividend_row is not None and c in self.dividends.columns and not math.isfinite(dividend_row[c]):
+                raise ValueError("Corporate action dividend must be finite")
+
+        # A split changes positions without a transaction, so invalidate cached tree values.
+        if split_row is not None:
+            for c in target.children:
+                if c in self.splits.columns:
+                    spl = split_row[c]
+                    if spl != 1.0:
+                        target.children[c]._position *= spl
+                        target.root.stale = True
+
+        # adjust capital due to dividends
+        if dividend_row is not None:
+            div_inflow = 0.0
+            for c in target.children:
+                if c in self.dividends.columns:
+                    div = dividend_row[c]
+                    if div != 0.0:
+                        div_inflow += div * target.children[c]._position
+
+            target.adjust(div_inflow, flow=False)
+
+        return True
+
+
+class CloseDead(Algo):
     """
     Closes all positions for which prices are equal to zero (we assume
     that these stocks are dead) and removes them from temp['weights'] if
@@ -1699,7 +1951,7 @@ class CloseDead(Algo):
     """
 
     def __init__(self):
-        super(CloseDead, self).__init__()
+        super().__init__()
 
     def __call__(self, target):
         if "weights" not in target.temp:
@@ -1707,7 +1959,7 @@ class CloseDead(Algo):
 
         targets = target.temp["weights"]
         for c in target.children:
-            if target.universe[c].loc[target.now] <= 0:
+            if target.universe.at[target.now, c] <= 0:
                 target.close(c)
                 if c in targets:
                     del targets[c]
@@ -1716,7 +1968,6 @@ class CloseDead(Algo):
 
 
 class SetNotional(Algo):
-
     """
     Sets the notional_value to use as the base for rebalancing for
     :class:`FixedIncomeStrategy <bt.core.FixedIncomeStrategy>` targets
@@ -1731,7 +1982,7 @@ class SetNotional(Algo):
 
     def __init__(self, notional_value):
         self.notional_value = notional_value
-        super(SetNotional, self).__init__()
+        super().__init__()
 
     def __call__(self, target):
         notional_value = target.get_data(self.notional_value)
@@ -1745,28 +1996,70 @@ class SetNotional(Algo):
 
 
 class Rebalance(Algo):
-
     """
     Rebalances capital based on temp['weights']
 
     Rebalances capital based on temp['weights']. Also closes
     positions if open but not in target_weights. This is typically
-    the last Algo called once the target weights have been set.
+    the last Algo called once the target weights have been set. Direct
+    security targets that require an adjustment are checked for missing or infinite
+    prices before mutation. Capital allocations also require a nonzero price;
+    quantity-based fixed-income trades and closing positions allow zero prices.
 
     Requires:
         * weights
         * cash (optional): You can set a 'cash' value on temp. This should be a
           number between 0-1 and determines the amount of cash to set aside.
           For example, if cash=0.3, the strategy will allocate 70% of its
-          value to the provided weights, and the remaining 30% will be kept
+          value among the provided weights, and the remaining 30% will be kept
           in cash. If this value is not provided (default), the full value
-          of the strategy is allocated to securities.
+          of the strategy is allocated to securities. Fixed-income strategies
+          ignore this value.
         * notional_value (optional): Required only for fixed_income targets. This is the base
           balue of total notional that will apply to the weights.
     """
 
     def __init__(self):
-        super(Rebalance, self).__init__()
+        super().__init__()
+
+    @staticmethod
+    def _validate_target_prices(target, targets, base, target_scale):
+        """Reject invalid direct target prices before portfolio mutation.
+
+        Mirror StrategyBase.rebalance's effective delta while inspecting lazy and
+        default targets without materializing them.
+        """
+        for cname, target_weight in targets.items():
+            child = target.children.get(cname)
+            if child is None:
+                child = target._lazy_children.get(cname)
+            if child is not None and not isinstance(child, SecurityBase):
+                continue
+
+            current_weight = child._weight if cname in target.children else 0.0
+            scaled_weight = target_weight * target_scale
+            # StrategyBase.rebalance routes zero weights directly to close.
+            if is_zero(scaled_weight):
+                continue
+            if target.fixed_income:
+                delta = scaled_weight * base - current_weight * target.notional_value
+            else:
+                delta = (scaled_weight - current_weight) * base
+            # Zero deltas bypass allocation.
+            if is_zero(delta):
+                continue
+
+            # Idle children may still cache the bootstrap-row price; allocation
+            # would refresh them from the current universe row before trading.
+            if cname in target._universe.columns and (cname not in target.children or child.now != target.now):
+                price = target._universe.loc[target.now, cname]
+            elif cname in target.children:
+                price = child._price
+            else:
+                price = np.nan
+            quantity_trade = target.fixed_income and child is not None and child.fixed_income
+            if pd.isna(price) or math.isinf(price) or (is_zero(price) and not quantity_trade):
+                raise ValueError(f"Cannot allocate capital to {cname} because price is {price} as of {target.now}")
 
     def __call__(self, target):
         if "weights" not in target.temp:
@@ -1785,8 +2078,16 @@ class Rebalance(Algo):
         else:
             base = target.value
 
-        # de-allocate children that are not in targets and have non-zero value
-        # (open positions)
+        # Child weights describe the investable slice; retain total value as the
+        # stable base so repeated cash-aware rebalances remain idempotent.
+        target_scale = 1.0
+        if "cash" in target.temp and not target.fixed_income:
+            target_scale -= target.temp["cash"]
+
+        # Reject direct target-price failures before holdings or registries change.
+        self._validate_target_prices(target, targets, base, target_scale)
+
+        # De-allocate open children that are not in targets.
         for cname in target.children:
             # if this child is in our targets, we don't want to close it out
             if cname in targets:
@@ -1798,18 +2099,15 @@ class Rebalance(Algo):
                 v = c.notional_value
             else:
                 v = c.value
-            # if non-zero and non-null, we need to close it out
-            if v != 0.0 and not np.isnan(v):
+
+            # Zero value can hide live ordinary positions directly or in a child strategy.
+            zero_value_child = not target.fixed_income and v == 0.0
+            if (v != 0.0 and not np.isnan(v)) or zero_value_child:
                 target.close(cname, update=False)
 
-        # If cash is set (it should be a value between 0-1 representing the
-        # proportion of cash to keep), calculate the new 'base'
-        if "cash" in target.temp and not target.fixed_income:
-            base = base * (1 - target.temp["cash"])
-
         # Turn off updating while we rebalance each child
-        for item in iteritems(targets):
-            target.rebalance(item[1], child=item[0], base=base, update=False)
+        for item in targets.items():
+            target.rebalance(item[1] * target_scale, child=item[0], base=base, update=False)
 
         # Now update
         target.root.update(target.now)
@@ -1818,13 +2116,16 @@ class Rebalance(Algo):
 
 
 class RebalanceOverTime(Algo):
-
     """
     Similar to Rebalance but rebalances to target
     weight over n periods.
 
     Rebalances towards a target weight over a n periods. Splits up the weight
-    delta over n periods.
+    delta over n periods. Current children with nonzero weights omitted from the
+    targets are phased out over the same periods. Omitted zero-weight hedges
+    remain untouched. For ordinary strategies reserving cash, target weights refer
+    to the investable slice, as in Rebalance. A full cash reserve still closes
+    positions immediately.
 
     This can be useful if we want to make more conservative rebalacing
     assumptions. Some strategies can produce large swings in allocations. It
@@ -1847,11 +2148,13 @@ class RebalanceOverTime(Algo):
 
     Requires:
         * weights
+        * cash (optional): fraction to reserve for the current period, as in
+          Rebalance. Fixed-income strategies ignore this value.
 
     """
 
     def __init__(self, n=10):
-        super(RebalanceOverTime, self).__init__()
+        super().__init__()
         self.n = float(n)
         self._rb = Rebalance()
         self._weights = None
@@ -1865,15 +2168,28 @@ class RebalanceOverTime(Algo):
 
         # if _weights are not None, we have some work to do
         if self._weights is not None:
+            # Normalize NAV weights to the investable-slice units Rebalance expects.
+            scale = 1.0
+            if "cash" in target.temp and not target.fixed_income:
+                scale -= target.temp["cash"]
+                # Full cash delegates to Rebalance's immediate close without division.
+                if scale == 0.0:
+                    scale = 1.0
             tgt = {}
-            # scale delta relative to # of periods left and set that as the new
-            # target
-            for cname in self._weights.keys():
-                curr = (
-                    target.children[cname].weight if cname in target.children else 0.0
-                )
-                dlt = (self._weights[cname] - curr) / self._days_left
+            # Read mapping entries by key and preserve their supplied order.
+            for cname, target_weight in self._weights.items():
+                curr = target.children[cname].weight / scale if cname in target.children else 0.0
+                dlt = (target_weight - curr) / self._days_left
                 tgt[cname] = curr + dlt
+
+            # Rebalance would otherwise close omitted holdings immediately.
+            for cname in target.children:
+                if cname not in tgt:
+                    curr = target.children[cname].weight / scale
+                    if curr == 0.0:
+                        continue
+                    dlt = -curr / self._days_left
+                    tgt[cname] = curr + dlt
 
             # mock weights and call real Rebalance
             target.temp["weights"] = tgt
@@ -1890,7 +2206,6 @@ class RebalanceOverTime(Algo):
 
 
 class Require(Algo):
-
     """
     Flow control Algo.
 
@@ -1915,7 +2230,7 @@ class Require(Algo):
     """
 
     def __init__(self, pred, item, if_none=False):
-        super(Require, self).__init__()
+        super().__init__()
         self.item = item
         self.pred = pred
         self.if_none = if_none
@@ -1944,7 +2259,7 @@ class Not(Algo):
     """
 
     def __init__(self, algo):
-        super(Not, self).__init__()
+        super().__init__()
         self._algo = algo
 
     def __call__(self, target):
@@ -1971,9 +2286,8 @@ class Or(Algo):
     """
 
     def __init__(self, list_of_algos):
-        super(Or, self).__init__()
+        super().__init__()
         self._list_of_algos = list_of_algos
-        return
 
     def __call__(self, target):
         res = False
@@ -1999,25 +2313,35 @@ class SelectTypes(Algo):
     """
 
     def __init__(self, include_types=(bt.core.Node,), exclude_types=()):
-        super(SelectTypes, self).__init__()
+        super().__init__()
         self.include_types = include_types
         self.exclude_types = exclude_types or (type(None),)
 
     def __call__(self, target):
-        selected = [
-            sec_name
-            for sec_name, sec in target.children.items()
-            if isinstance(sec, self.include_types)
-            and not isinstance(sec, self.exclude_types)
-        ]
-        if "selected" in target.temp:
-            selected = [s for s in selected if s in target.temp["selected"]]
+        selected = [sec_name for sec_name, sec in target.children.items() if isinstance(sec, self.include_types) and not isinstance(sec, self.exclude_types)]
+        if selected and "selected" in target.temp:
+            prior = target.temp["selected"]
+            # A local set avoids rescanning a long prior list for every child in
+            # wide universes, while filtering still preserves child order.
+            # Keep short or sparse selections on the list path; set construction
+            # costs more than a few membership checks. Only plain strings are interchangeable.
+            if (
+                type(prior) is list
+                and len(selected) >= 32
+                and 32 <= len(prior) <= 4 * len(selected)
+                and all(type(s) is str for s in prior)
+                and all(type(s) is str for s in selected)
+            ):
+                prior = set(prior)
+                selected = [s for s in selected if s in prior]
+            else:
+                # Preserve per-child reads for caller-defined membership.
+                selected = [s for s in selected if s in target.temp["selected"]]
         target.temp["selected"] = selected
         return True
 
 
 class ClosePositionsAfterDates(Algo):
-
     """
     Close positions on securities after a given date.
     This can be used to make sure positions on matured/redeemed securities are
@@ -2043,7 +2367,7 @@ class ClosePositionsAfterDates(Algo):
     """
 
     def __init__(self, close_dates):
-        super(ClosePositionsAfterDates, self).__init__()
+        super().__init__()
         self.close_dates = close_dates
 
     def __call__(self, target):
@@ -2052,11 +2376,7 @@ class ClosePositionsAfterDates(Algo):
         close_dates = target.get_data(self.close_dates)["date"]
         # Find securities that are candidate for closing
         sec_names = [
-            sec_name
-            for sec_name, sec in iteritems(target.children)
-            if isinstance(sec, SecurityBase)
-            and sec_name in close_dates.index
-            and sec_name not in target.perm["closed"]
+            sec_name for sec_name, sec in target.children.items() if isinstance(sec, SecurityBase) and sec_name in close_dates.index and sec_name not in target.perm["closed"]
         ]
 
         # Check whether closed
@@ -2074,7 +2394,6 @@ class ClosePositionsAfterDates(Algo):
 
 
 class RollPositionsAfterDates(Algo):
-
     """
     Roll securities based on the provided map.
     This can be used for any securities which have "On-The-Run" and "Off-The-Run"
@@ -2086,47 +2405,70 @@ class RollPositionsAfterDates(Algo):
 
     Args:
         * roll_data (str): the name of a dataframe indexed by security name, with columns
+
             - "date": the first date at which the roll can occur
             - "target": the security name we are rolling into
             - "factor": the conversion factor. One unit of the original security
-              rolls into "factor" units of the new one.
+              rolls into "factor" units of the new one. Applicable factors and
+              resulting quantities must be finite and are validated before
+              portfolio state changes.
+
+    Known execution limitation: roll execution is not atomic. An execution
+    error can leave earlier trades and ``target.perm['rolled']`` entries
+    applied; completed changes are not rolled back.
 
     Sets:
         * target.perm['rolled'] : to keep track of which securities have already rolled
     """
 
     def __init__(self, roll_data):
-        super(RollPositionsAfterDates, self).__init__()
+        super().__init__()
         self.roll_data = roll_data
 
     def __call__(self, target):
-        if "rolled" not in target.perm:
-            target.perm["rolled"] = set()
         roll_data = target.get_data(self.roll_data)
+        rolled = target.perm.get("rolled", set())
         transactions = {}
         # Find securities that are candidate for roll
-        sec_names = [
-            sec_name
-            for sec_name, sec in iteritems(target.children)
-            if isinstance(sec, SecurityBase)
-            and sec_name in roll_data.index
-            and sec_name not in target.perm["rolled"]
-        ]
+        sec_names = [sec_name for sec_name, sec in target.children.items() if isinstance(sec, SecurityBase) and sec_name in roll_data.index and sec_name not in rolled]
 
-        # Calculate new transaction and close old position
-        for sec_name, sec_fields in roll_data.loc[sec_names].iterrows():
-            if sec_fields["date"] <= target.now:
-                target.perm["rolled"].add(sec_name)
-                new_quantity = sec_fields["factor"] * target[sec_name].position
-                new_sec = sec_fields["target"]
-                if new_sec in transactions:
-                    transactions[new_sec] += new_quantity
-                else:
-                    transactions[new_sec] = new_quantity
-                target.close(sec_name, update=False)
+        # Build and validate the complete due transaction plan before mutation.
+        due_rolls = roll_data.loc[sec_names]
+        due_rolls = due_rolls[due_rolls["date"] <= target.now]
+        for sec_name, sec_fields in due_rolls.iterrows():
+            factor = sec_fields["factor"]
+            factor_array = np.asarray(factor)
+            if factor_array.ndim != 0 or factor_array.dtype.kind not in "biuf" or not np.isfinite(factor_array).item():
+                raise ValueError("Roll factors and resulting quantities must be finite")
+
+            with np.errstate(over="raise", invalid="raise"):
+                try:
+                    new_quantity = float(factor * target[sec_name].position)
+                    new_sec = sec_fields["target"]
+                    if new_sec in transactions:
+                        new_quantity += transactions[new_sec]
+                except FloatingPointError as exc:
+                    raise ValueError("Roll factors and resulting quantities must be finite") from exc
+            if not np.isfinite(new_quantity):
+                raise ValueError("Roll factors and resulting quantities must be finite")
+            transactions[new_sec] = new_quantity
+
+        # Due sources are closed before transfers; other destinations retain their positions.
+        for new_sec, quantity in transactions.items():
+            child = target.children.get(new_sec)
+            if isinstance(child, SecurityBase) and new_sec not in due_rolls.index and not np.isfinite(float(child.position) + quantity):
+                raise ValueError("Roll factors and resulting quantities must be finite")
+
+        if "rolled" not in target.perm:
+            target.perm["rolled"] = set()
+
+        # Apply the validated plan only after every due row has succeeded.
+        for sec_name in due_rolls.index:
+            target.perm["rolled"].add(sec_name)
+            target.close(sec_name, update=False)
 
         # Do all the new transactions at the end, to do any necessary aggregations first
-        for new_sec, quantity in iteritems(transactions):
+        for new_sec, quantity in transactions.items():
             target.transact(quantity, new_sec, update=False)
 
         # Now update
@@ -2136,7 +2478,6 @@ class RollPositionsAfterDates(Algo):
 
 
 class SelectActive(Algo):
-
     """
     Sets temp['selected'] based on filtering temp['selected'] to exclude
     those securities that have been closed or rolled after a certain date
@@ -2156,18 +2497,100 @@ class SelectActive(Algo):
         selected = target.temp["selected"]
         rolled = target.perm.get("rolled", set())
         closed = target.perm.get("closed", set())
-        selected = [s for s in selected if s not in set.union(rolled, closed)]
+        # Avoid rebuilding large exclusion sets for each ordinary selected label.
+        # Keep short selections on the original path: registry label scans cost more
+        # than a few unions. Only inspect label types when that preparation can pay off.
+        # Other containers or label hooks retain per-label evaluation, including no-work calls.
+        if (
+            type(selected) is list
+            and len(selected) >= 32
+            and type(rolled) is set
+            and type(closed) is set
+            and all(type(s) is str for s in selected)
+            and all(type(s) is str for s in rolled)
+            and all(type(s) is str for s in closed)
+        ):
+            excluded = set.union(rolled, closed)
+            selected = [s for s in selected if s not in excluded]
+        else:
+            selected = [s for s in selected if s not in set.union(rolled, closed)]
         target.temp["selected"] = selected
         return True
 
 
-class ReplayTransactions(Algo):
+def _validate_transaction_security(target, security):
+    """Validate a declared or market-backed transaction target without creating it."""
+    if security in target.children:
+        child = target.children[security]
+    elif security in target._lazy_children:
+        child = target._lazy_children[security]
+    elif security in target.universe.columns:
+        return
+    else:
+        raise KeyError(security)
 
+    if not isinstance(child, SecurityBase):
+        raise TypeError(f"Transaction target {security!r} is not a security")
+
+
+def _transaction_quantity_is_noop(quantity):
+    """Validate a transaction quantity and report whether dispatch is a no-op."""
+    if np.iscomplexobj(quantity):
+        raise ValueError("Transaction quantity must be real")
+    try:
+        if math.isnan(quantity):
+            return True
+        if not math.isfinite(quantity):
+            raise ValueError("Transaction quantity must be finite")
+        return is_zero(quantity)
+    except (TypeError, OverflowError) as exc:
+        raise ValueError("Transaction quantity must be numeric") from exc
+
+
+def _validate_transaction_price(price):
+    """Validate a custom transaction price used by an actionable quantity."""
+    if np.iscomplexobj(price):
+        raise ValueError("Transaction price must be real")
+    try:
+        finite = math.isfinite(price)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Transaction price must be numeric") from exc
+    if not finite:
+        raise ValueError("Transaction price must be finite")
+
+
+def _preflight_transactions(target, transactions):
+    """Validate a complete transaction batch before dispatch can mutate state."""
+    prepared = []
+    for (_, security), transaction in transactions.iterrows():
+        _validate_transaction_security(target, security)
+        quantity = transaction["quantity"]
+        price = transaction["price"]
+        if not _transaction_quantity_is_noop(quantity) and price is not None:
+            _validate_transaction_price(price)
+            price = float(price)
+        prepared.append((security, float(quantity), price))
+    return prepared
+
+
+def _resolve_transaction_security(target, security):
+    """Resolve a preflighted security for transaction dispatch."""
+    _validate_transaction_security(target, security)
+
+    target._create_child_if_needed(security)
+    return target[security]
+
+
+class ReplayTransactions(Algo):
     """
     Replay a list of transactions that were executed.
     This is useful for taking a blotter of actual trades that occurred,
     and measuring performance against hypothetical strategies.
-    In particular, one can replay the outputs of backtest.Result.get_transactions
+    In particular, one can replay the outputs of backtest.Result.get_transactions.
+    Securities may be existing children, lazily declared children, or available
+    columns in the target's market-data universe.
+    The selected batch is validated before dispatch so an invalid target,
+    actionable quantity, or required custom price cannot partially replay it.
 
     Note that this allows the timestamps and prices of the reported transactions
     to be completely arbitrary, so while the strategy may track performance
@@ -2184,7 +2607,7 @@ class ReplayTransactions(Algo):
     """
 
     def __init__(self, transactions):
-        super(ReplayTransactions, self).__init__()
+        super().__init__()
         self.transactions = transactions
 
     def __call__(self, target):
@@ -2192,18 +2615,18 @@ class ReplayTransactions(Algo):
         index = timeline.get_loc(target.now)
         end = target.now
         if index == 0:
-            start = pd.Timestamp.min
+            # UTC makes the minimum comparable to aware clocks without underflowing
+            # when their local timezone has a positive offset.
+            start = pd.Timestamp.min if getattr(end, "tzinfo", None) is None else pd.Timestamp.min.tz_localize("UTC")
         else:
             start = timeline[index - 1]
         # Get the transactions since the last update
         all_transactions = target.get_data(self.transactions)
         timestamps = all_transactions.index.get_level_values("Date")
         transactions = all_transactions[(timestamps > start) & (timestamps <= end)]
-        for (_, security), transaction in transactions.iterrows():
-            c = target[security]
-            c.transact(
-                transaction["quantity"], price=transaction["price"], update=False
-            )
+        for security, quantity, price in _preflight_transactions(target, transactions):
+            c = _resolve_transaction_security(target, security)
+            c.transact(quantity, price=price, update=False)
 
         # Now update
         target.root.update(target.now)
@@ -2217,10 +2640,14 @@ class SimulateRFQTransactions(Algo):
     using a "model" that determines which ones becomes transactions and at what price
     those transactions happen. This can be used from the perspective of the sender of the
     RFQ or the receiver.
+    Transaction securities may be existing children, lazily declared children, or
+    available columns in the target's market-data universe.
+    Returned batches are validated before dispatch so an invalid target,
+    actionable quantity, or required custom price cannot partially execute them.
 
     Args:
         * rfqs (str): name of a dataframe with columns
-          Date, Security | quantity, *additional columns as required by model
+          Date, Security | quantity, and additional columns as required by model
         * model (object): a function/callable object with arguments
                 - rfqs : data frame of rfqs to respond to
                 - target : the strategy object, for access to position and value data
@@ -2229,7 +2656,7 @@ class SimulateRFQTransactions(Algo):
     """
 
     def __init__(self, rfqs, model):
-        super(SimulateRFQTransactions, self).__init__()
+        super().__init__()
         self.rfqs = rfqs
         self.model = model
 
@@ -2238,7 +2665,9 @@ class SimulateRFQTransactions(Algo):
         index = timeline.get_loc(target.now)
         end = target.now
         if index == 0:
-            start = pd.Timestamp.min
+            # UTC makes the minimum comparable to aware clocks without underflowing
+            # when their local timezone has a positive offset.
+            start = pd.Timestamp.min if getattr(end, "tzinfo", None) is None else pd.Timestamp.min.tz_localize("UTC")
         else:
             start = timeline[index - 1]
         # Get the RFQs since the last update
@@ -2249,11 +2678,9 @@ class SimulateRFQTransactions(Algo):
         # Turn the RFQs into transactions
         transactions = self.model(rfqs, target)
 
-        for (_, security), transaction in transactions.iterrows():
-            c = target[security]
-            c.transact(
-                transaction["quantity"], price=transaction["price"], update=False
-            )
+        for security, quantity, price in _preflight_transactions(target, transactions):
+            c = _resolve_transaction_security(target, security)
+            c.transact(quantity, price=price, update=False)
 
         # Now update
         target.root.update(target.now)
@@ -2264,20 +2691,23 @@ class SimulateRFQTransactions(Algo):
 def _get_unit_risk(security, data, index=None):
     try:
         unit_risks = data[security]
-        unit_risk = unit_risks.values[index]
-    except Exception:
+        unit_risk = unit_risks.iloc[index]
+    except Exception:  # noqa: BLE001
         # No risk data, assume zero
         unit_risk = 0.0
     return unit_risk
 
 
 class UpdateRisk(Algo):
-
     """
     Tracks a risk measure on all nodes of the strategy. To use this node, the
     ``additional_data`` argument on :class:`Backtest <bt.backtest.Backtest>` must
     have a "unit_risk" key. The value should be a dictionary, keyed
     by risk measure, of DataFrames with a column per security that is sensitive to that measure.
+
+    Infinite unit risk for positions not treated as zero raises ValueError; exposure arithmetic overflow
+    raises ValueError or FloatingPointError before current risk or history is changed. NaN risk
+    still propagates for downstream handling, and missing security columns still contribute zero.
 
     Args:
         * name (str): the name of the risk measure (IR01, PVBP, IsIndustials, etc).
@@ -2293,7 +2723,7 @@ class UpdateRisk(Algo):
     """
 
     def __init__(self, measure, history=0):
-        super(UpdateRisk, self).__init__(name="UpdateRisk>%s" % measure)
+        super().__init__(name=f"UpdateRisk>{measure}")
         self.measure = measure
         self.history = history
 
@@ -2305,18 +2735,11 @@ class UpdateRisk(Algo):
 
     def _setup_measure(self, target, set_history):
         """Setup a risk measure within the risk attributes on the node in question"""
-        target.risk[self.measure] = np.NaN
+        target.risk[self.measure] = np.nan
         if set_history:
-            target.risks[self.measure] = np.NaN
+            target.risks[self.measure] = np.nan
 
-    def _set_risk_recursive(self, target, depth, unit_risk_frame):
-        set_history = depth < self.history
-        # General setup of risk on nodes
-        if not hasattr(target, "risk"):
-            self._setup_risk(target, set_history)
-        if self.measure not in target.risk:
-            self._setup_measure(target, set_history)
-
+    def _calculate_risk(self, target, depth, unit_risk_frame, risks):
         if isinstance(target, bt.core.SecurityBase):
             # Use target.root.now as non-traded securities may not have been updated yet
             # and there is no need to update them here as we only use position
@@ -2325,25 +2748,51 @@ class UpdateRisk(Algo):
             if is_zero(target.position):
                 risk = 0.0
             else:
+                if not pd.isna(unit_risk) and math.isinf(unit_risk):
+                    raise ValueError(f"Infinite unit risk for {target.name} in {self.measure}")
                 risk = unit_risk * target.position * target.multiplier
         else:
             risk = 0.0
             for child in target.children.values():
-                self._set_risk_recursive(child, depth + 1, unit_risk_frame)
-                risk += child.risk[self.measure]
+                risk += self._calculate_risk(child, depth + 1, unit_risk_frame, risks)
+                if not pd.isna(risk) and math.isinf(risk):
+                    raise ValueError(f"Infinite risk for {target.name} in {self.measure}")
 
-        target.risk[self.measure] = risk
-        if depth < self.history:
-            target.risks.loc[target.now, self.measure] = risk
+        if not pd.isna(risk) and math.isinf(risk):
+            raise ValueError(f"Infinite risk for {target.name} in {self.measure}")
+        risks.append((target, depth, risk))
+        return risk
 
     def __call__(self, target):
         unit_risk_frame = target.get_data("unit_risk")[self.measure]
-        self._set_risk_recursive(target, 0, unit_risk_frame)
+        risks = []
+        # Reject bad leaves and totals before initializing or publishing any risk state.
+        with np.errstate(over="raise"):
+            self._calculate_risk(target, 0, unit_risk_frame, risks)
+
+        for node, depth, risk in risks:
+            set_history = depth < self.history
+            if not hasattr(node, "risk"):
+                self._setup_risk(node, set_history)
+            # Different measures may track history at different tree depths.
+            if set_history and not hasattr(node, "risks"):
+                node.risks = pd.DataFrame(index=node.data.index)
+            if self.measure not in node.risk:
+                self._setup_measure(node, set_history)
+            node.risk[self.measure] = risk
+            if set_history:
+                # Idle securities can retain an older clock; risk is calculated at root.now.
+                # Scalar writes avoid general selection for each tracked node; other
+                # history representations retain their original indexer semantics.
+                history = node.risks
+                if type(history) is pd.DataFrame and isinstance(self.measure, str):
+                    history.at[node.root.now, self.measure] = risk
+                else:
+                    history.loc[node.root.now, self.measure] = risk
         return True
 
 
 class PrintRisk(Algo):
-
     """
     This Algo prints the risk data.
 
@@ -2355,7 +2804,7 @@ class PrintRisk(Algo):
     """
 
     def __init__(self, fmt_string=""):
-        super(PrintRisk, self).__init__()
+        super().__init__()
         self.fmt_string = fmt_string
 
     def __call__(self, target):
@@ -2370,6 +2819,11 @@ class PrintRisk(Algo):
 class HedgeRisks(Algo):
     """
     Hedges risk measures with selected instruments.
+
+    Unit risk is scaled by each selected security's multiplier to obtain its
+    per-contract sensitivity. Infinite hedge notionals are rejected before any
+    hedge transaction. NaN hedge notionals are also rejected before trading when
+    ``throw_nan`` is True.
 
     Make sure that the UpdateRisk algo has been called beforehand.
 
@@ -2394,7 +2848,7 @@ class HedgeRisks(Algo):
     """
 
     def __init__(self, measures, pseudo=False, strategy=None, throw_nan=True):
-        super(HedgeRisks, self).__init__()
+        super().__init__()
         if len(measures) == 0:
             raise ValueError("Must pass in at least one measure to hedge")
         self.measures = measures
@@ -2404,24 +2858,20 @@ class HedgeRisks(Algo):
 
     def _get_target_risk(self, target, measure):
         if not hasattr(target, "risk"):
-            raise ValueError("risk not set up on target %s" % target.name)
+            raise ValueError(f"risk not set up on target {target.name}")
         if measure not in target.risk:
-            raise ValueError("measure %s not set on target %s" % (measure, target.name))
+            raise ValueError(f"measure {measure} not set on target {target.name}")
         return target.risk[measure]
 
     def __call__(self, target):
         securities = target.temp["selected"]
 
         # Get target risk
-        target_risk = np.array(
-            [self._get_target_risk(target, m) for m in self.measures]
-        )
+        target_risk = np.array([self._get_target_risk(target, m) for m in self.measures])
         if self.strategy is not None:
             # Add the target risk of the strategy to the risk of the target
             # (which contains existing hedges)
-            target_risk += np.array(
-                [self._get_target_risk(self.strategy, m) for m in self.measures]
-            )
+            target_risk += np.array([self._get_target_risk(self.strategy, m) for m in self.measures])
         # Turn target_risk into a column array
         target_risk = target_risk.reshape(len(self.measures), 1)
 
@@ -2430,16 +2880,21 @@ class HedgeRisks(Algo):
         for m in self.measures:
             d = target.get_data("unit_risk").get(m)
             if d is None:
-                raise ValueError(
-                    "unit_risk for %s not present in temp on %s"
-                    % (self.measure, target.name)
-                )
+                raise ValueError(f"unit_risk for {m} not present in temp on {target.name}")
             i = d.index.get_loc(target.now)
             data.append((i, d))
 
-        hedge_risk = np.array(
-            [[_get_unit_risk(s, d, i) for (i, d) in data] for s in securities]
-        )
+        hedge_risk = np.array([[_get_unit_risk(s, d, i) for (i, d) in data] for s in securities])
+        hedge_risk = hedge_risk.astype(float, copy=False)
+        for row in range(hedge_risk.shape[0]):
+            security = securities[row]
+            child = target.children.get(security)
+            if child is None:
+                child = target._lazy_children.get(security)
+
+            # Undeclared names become multiplier-one Securities when transacted.
+            if isinstance(child, bt.core.SecurityBase):
+                hedge_risk[row] *= child.multiplier
 
         # Get hedge ratios
         if self.pseudo:
@@ -2448,9 +2903,76 @@ class HedgeRisks(Algo):
             inv = np.linalg.inv(hedge_risk).T
         notionals = np.matmul(inv, -target_risk).flatten()
 
-        # Hedge
+        # Validate the whole plan before dispatch: a later invalid quantity must
+        # not leave earlier fills or consume a lazily declared hedge security.
         for notional, security in zip(notionals, securities):
+            if np.isinf(notional):
+                raise ValueError(f"{security} has infinite hedge notional")
             if np.isnan(notional) and self.throw_nan:
-                raise ValueError("%s has nan hedge notional" % security)
+                raise ValueError(f"{security} has nan hedge notional")
+
+        # Preserve native NaN dispatch when throw_nan is disabled.
+        for notional, security in zip(notionals, securities):
             target.transact(notional, security)
+        return True
+
+
+class Margin(Algo):
+    """
+    Model margin lending by periodically charging interest and liquidating a leveraged long
+    portfolio when it falls below a specified maintenance requirement.
+
+    For a portfolio with positive equity, liquidation targets the maintenance requirement when
+    no transaction costs apply. Integer-position constraints may liquidate beyond that boundary.
+
+    Args:
+        * rate (float): the margin interest rate. i.e: 0.05 -> 5%
+        * requirement (float): the maintenance requirement. The algorithm will liquidate the portfolio if the
+        equity falls below this percentage.
+    """
+
+    def __init__(self, rate, requirement):
+        super().__init__(Margin.__name__)
+        self.rate = rate
+        self.requirement = requirement
+        self._last_date = None
+
+    def _daily_rate(self):
+        return math.pow(1 + self.rate, 1 / 365.25) - 1
+
+    def __call__(self, target):
+        if self._last_date is None:
+            self._last_date = target.now
+            return True
+
+        # how many days since we calculated interest
+        diff = target.now - self._last_date
+
+        # the margin amount is the difference
+        margin = -target.capital
+
+        if margin > 0:
+            # get the total value of this portfolio
+            port_val = 0
+            for child in target.children.values():
+                port_val += child.value
+
+            # calculate the interest on the margin
+            f = math.pow(1 + self._daily_rate(), diff.days) - 1
+            fee = margin * f
+
+            # charge it
+            target.adjust(-fee, flow=False, fee=fee)
+
+            equity_ratio = target.value / port_val
+            # check and see if we are below our margin requirement
+            if equity_ratio < self.requirement:
+                max_value = target.value * (1 / self.requirement)
+
+                # Strategy.allocate applies the amount through child weights, which sum to port_val / equity.
+                deficit = max_value - port_val
+                target.allocate(deficit * equity_ratio)
+
+        # update our date
+        self._last_date = target.now
         return True
